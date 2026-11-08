@@ -129,7 +129,7 @@ Once installed in `~/.omp/agent/extensions/smol-omp-antigravity-acp`, `oh-my-pi`
 
 ```bash
 # List discovered Antigravity models
-omp --list-models google-antigravity
+omp models google-antigravity
 
 # Start omp with a specific Antigravity model
 omp --model google-antigravity/gemini-3.8-flash
