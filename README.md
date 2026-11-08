@@ -42,7 +42,7 @@ By running `agy acp` locally as a subprocess, the official binary handles authen
 
 ## How It Works
 
-`oh-my-pi` expects an LLM provider to stream completions and yield on tool calls so the harness can execute them, whereas `agy acp` expects to run an internal tool execution loop. `omp-antigravity-acp` bridges the two using two core mechanisms:
+`oh-my-pi` expects an LLM provider to stream completions and yield on tool calls so the harness can execute them, whereas `agy acp` expects to run an internal tool execution loop. `smol-omp-antigravity-acp` bridges the two using two core mechanisms:
 
 ### 1. Two-Turn Suspended MCP Bridge ([`src/mcp-bridge.ts`](./src/mcp-bridge.ts))
 1. When creating an ACP session, the extension registers a local MCP server named `"omp"` over a Named Pipe (Windows) or Unix Domain Socket (POSIX) with `disableBuiltInTools: true`.
@@ -75,12 +75,12 @@ By running `agy acp` locally as a subprocess, the official binary handles authen
 Install directly via `oh-my-pi`'s built-in plugin manager:
 
 ```bash
-omp plugin install github:int3rrobang/omp-antigravity-acp
+omp plugin install github:int3rrobang/smol-omp-antigravity-acp
 ```
 
 Or from inside the `omp` TUI:
 ```text
-/plugin install github:int3rrobang/omp-antigravity-acp
+/plugin install github:int3rrobang/smol-omp-antigravity-acp
 ```
 
 ### Option 2: Via OMP Marketplace Catalog
@@ -88,44 +88,44 @@ Or from inside the `omp` TUI:
 Because this repository includes `.omp-plugin/marketplace.json`, you can register it as an OMP marketplace source:
 
 ```bash
-omp plugin marketplace add int3rrobang/omp-antigravity-acp
-omp plugin install omp-antigravity-acp@omp-antigravity-acp
+omp plugin marketplace add int3rrobang/smol-omp-antigravity-acp
+omp plugin install smol-omp-antigravity-acp@smol-omp-antigravity-acp
 ```
 
 Or from inside the `omp` TUI:
 ```text
-/marketplace add int3rrobang/omp-antigravity-acp
-/marketplace install omp-antigravity-acp
+/marketplace add int3rrobang/smol-omp-antigravity-acp
+/marketplace install smol-omp-antigravity-acp
 ```
 
 ### Option 3: Manual Installation
 
-Clone or copy into `~/.omp/agent/extensions/omp-antigravity-acp`:
+Clone or copy into `~/.omp/agent/extensions/smol-omp-antigravity-acp`:
 
 **Windows (PowerShell):**
 ```powershell
 # Clone directly:
-git clone https://github.com/int3rrobang/omp-antigravity-acp.git "$HOME\.omp\agent\extensions\omp-antigravity-acp"
+git clone https://github.com/int3rrobang/smol-omp-antigravity-acp.git "$HOME\.omp\agent\extensions\smol-omp-antigravity-acp"
 
 # Or copy a local clone:
-Copy-Item -Path .\omp-antigravity-acp -Destination "$HOME\.omp\agent\extensions\omp-antigravity-acp" -Recurse -Force
+Copy-Item -Path .\smol-omp-antigravity-acp -Destination "$HOME\.omp\agent\extensions\smol-omp-antigravity-acp" -Recurse -Force
 ```
 
 **macOS / Linux:**
 ```bash
 # Clone directly:
-git clone https://github.com/int3rrobang/omp-antigravity-acp.git ~/.omp/agent/extensions/omp-antigravity-acp
+git clone https://github.com/int3rrobang/smol-omp-antigravity-acp.git ~/.omp/agent/extensions/smol-omp-antigravity-acp
 
 # Or copy a local clone:
 mkdir -p ~/.omp/agent/extensions
-cp -R ./omp-antigravity-acp ~/.omp/agent/extensions/omp-antigravity-acp
+cp -R ./smol-omp-antigravity-acp ~/.omp/agent/extensions/smol-omp-antigravity-acp
 ```
 
 ---
 
 ## Usage
 
-Once installed in `~/.omp/agent/extensions/omp-antigravity-acp`, `oh-my-pi` loads the extension automatically on startup:
+Once installed in `~/.omp/agent/extensions/smol-omp-antigravity-acp`, `oh-my-pi` loads the extension automatically on startup:
 
 ```bash
 # List discovered Antigravity models

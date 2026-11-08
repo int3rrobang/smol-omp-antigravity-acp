@@ -1,5 +1,5 @@
 {
-  "name": "omp-antigravity-acp",
+  "name": "smol-omp-antigravity-acp",
   "owner": {
     "name": "int3rrobang"
   },
@@ -9,7 +9,7 @@
   },
   "plugins": [
     {
-      "name": "omp-antigravity-acp",
+      "name": "smol-omp-antigravity-acp",
       "description": "Official Antigravity ACP (agy acp) provider plugin for oh-my-pi with stateful session keep-alive and suspended MCP tool handoff",
       "source": "./",
       "version": "0.1.0",
