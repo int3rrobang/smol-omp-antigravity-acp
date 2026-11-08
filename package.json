@@ -1,0 +1,18 @@
+{
+  "name": "omp-antigravity-acp",
+  "version": "0.1.0",
+  "description": "Official Antigravity ACP (agy acp) provider plugin for oh-my-pi with stateful session keep-alive and suspended MCP tool handoff",
+  "type": "module",
+  "main": "./index.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/int3rrobang/omp-antigravity-acp.git"
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
