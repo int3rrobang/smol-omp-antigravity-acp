@@ -496,6 +496,7 @@ export function streamAntigravityAcp(
           partial.stopReason = "toolUse";
           activeSession.syncedMessageCount = context.messages.length + 1;
           activeSession.prefixHash = computeMessagesHash(context.messages);
+          pool.recordSessionState(sessionKey);
           // Unbind abort signal while oh-my-pi executes the tool locally so a user
           // steer/interrupt during tool execution aborts only the local tool, keeping
           // pendingMcpBatch alive to receive the aborted toolResult + steer on the next step.
@@ -516,6 +517,7 @@ export function streamAntigravityAcp(
           partial.stopReason = "stop";
           activeSession.syncedMessageCount = context.messages.length + 1;
           activeSession.prefixHash = computeMessagesHash(context.messages);
+          pool.recordSessionState(sessionKey);
           pool.unbindAbortSignal(activeSession);
 
           stream.push({
@@ -601,6 +603,7 @@ export function streamAntigravityAcp(
         // so an abort/steer-flush mid-generation still preserves prefix continuity.
         session.syncedMessageCount = context.messages.length + 1;
         session.prefixHash = computeMessagesHash(context.messages);
+        pool.recordSessionState(sessionKey);
 
         // Attach listener & abort signal for this resumed step
         attachEventListener(session, activePromptPromise);
@@ -672,6 +675,7 @@ export function streamAntigravityAcp(
         // Checkpoint prefix before dispatching so an abort mid-stream preserves continuity
         session.syncedMessageCount = context.messages.length + 1;
         session.prefixHash = computeMessagesHash(context.messages);
+        pool.recordSessionState(sessionKey);
 
         const promptPromise = pool.sendPrompt(session, promptBlocks, options?.signal);
         attachEventListener(session, promptPromise);
@@ -698,6 +702,7 @@ export function streamAntigravityAcp(
     // Checkpoint prefix before dispatching so an abort on Turn 1 still preserves continuity for Turn 2
     session.syncedMessageCount = context.messages.length + 1;
     session.prefixHash = computeMessagesHash(context.messages);
+    pool.recordSessionState(sessionKey);
 
     const promptBlocks = formatFullHistoryTranscript(context.messages);
     const promptPromise = pool.sendPrompt(session, promptBlocks, options?.signal);

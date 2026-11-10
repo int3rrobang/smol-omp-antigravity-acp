@@ -470,6 +470,21 @@ export interface LiveAcpSession {
   lastUsedAt: number;
 }
 
+/**
+ * Durable handle for a live ACP conversation, persisted by the host extension
+ * (omp session entries) so a later process can reattach with `session/load`
+ * instead of replaying the transcript.
+ */
+export interface PersistedAcpSessionState {
+  acpSessionId: string;
+  cwd: string;
+  model: string;
+  effort?: string;
+  systemPromptHash: string;
+  syncedMessageCount: number;
+  prefixHash: string;
+}
+
 export class AcpSessionPool {
   public mcpBridge: McpBridgeServer;
   private conn: AcpConnection | null = null;
@@ -478,6 +493,12 @@ export class AcpSessionPool {
   private lastSessionNewResult: any = null;
   private evictionInterval: NodeJS.Timeout | null = null;
   private connecting: Promise<AcpConnection> | null = null;
+  private resumeCandidates = new Map<string, PersistedAcpSessionState>();
+  /**
+   * Persist (or clear, with `null`) this session's ACP handle. The host wires
+   * this to `pi.appendEntry` so the handle rides along with the omp session.
+   */
+  public onSessionState?: (sessionKey: string, state: PersistedAcpSessionState | null) => void;
 
   constructor(apiKey?: string) {
     this.mcpBridge = new McpBridgeServer();
@@ -540,6 +561,33 @@ export class AcpSessionPool {
     return this.sessions.get(sessionKey);
   }
 
+  /** Offer a previously persisted handle; `null` means "nothing to reattach to". */
+  public setResumeCandidate(sessionKey: string, state: PersistedAcpSessionState | null): void {
+    if (state) this.resumeCandidates.set(sessionKey, state);
+    else this.resumeCandidates.delete(sessionKey);
+  }
+
+  /** Snapshot the checkpoint so a later process can resume from it. */
+  public recordSessionState(sessionKey: string): void {
+    if (!this.onSessionState) return;
+    const session = this.sessions.get(sessionKey);
+    if (!session || !session.prefixHash) return;
+    this.onSessionState(sessionKey, {
+      acpSessionId: session.acpSessionId,
+      cwd: session.cwd,
+      model: session.currentModelId,
+      effort: session.currentEffort,
+      systemPromptHash: session.systemPromptHash,
+      syncedMessageCount: session.syncedMessageCount,
+      prefixHash: session.prefixHash,
+    });
+  }
+
+  /** Drop any durable handle for this session (branch switch, reset). */
+  public clearPersistedSession(sessionKey: string): void {
+    this.onSessionState?.(sessionKey, null);
+  }
+
   public async createSession(
     sessionKey: string,
     cwd: string,
@@ -550,6 +598,7 @@ export class AcpSessionPool {
     hasTools: boolean = true,
   ): Promise<LiveAcpSession> {
     const conn = await this.ensureConnection(apiKey);
+    const resume = this.resumeCandidates.get(sessionKey);
 
     // Close any previous session for this key
     await this.resetSession(sessionKey);
@@ -609,22 +658,52 @@ export class AcpSessionPool {
       },
     };
 
+    const systemPromptHash = systemPromptAppend
+      ? createHash("sha256").update(systemPromptAppend).digest("hex")
+      : "";
+
     let sessionNewResult: any;
-    try {
-      sessionNewResult = await conn.request("session/new", sessionParams, 60000);
-    } catch (err: any) {
-      // Authentication required error code (-32000)
-      if (err?.code === -32000 || String(err?.message || "").includes("Authentication required")) {
-        const hasRealKey = (k?: string) =>
-          Boolean(k && k !== "acp-managed" && !k.startsWith("{") && !k.startsWith("<"));
-        const methodId =
-          hasRealKey(apiKey) || hasRealKey(process.env.GEMINI_API_KEY)
-            ? "gemini-api-key"
-            : "oauth-personal";
-        await conn.authenticate({ methodId });
+    let resumed = false;
+
+    // Reattach to the conversation agy still holds instead of replaying the
+    // history: same server-side context (thinking included), no transcript, no
+    // re-billed tokens. `session/resume` is the validating call — it fails for a
+    // conversation agy no longer has, whereas `session/load` silently starts an
+    // empty one under the same id and would drop the history without a trace.
+    if (resume && resume.cwd === cwd && resume.systemPromptHash === systemPromptHash) {
+      try {
+        const restored = (await conn.request(
+          "session/resume",
+          { sessionId: resume.acpSessionId, ...sessionParams },
+          60000,
+        )) as { sessionId?: string } | null;
+        if (restored?.sessionId) {
+          sessionNewResult = restored;
+          resumed = true;
+        }
+      } catch {
+        // Conversation gone (agy restart, cleanup), or a build without
+        // session/resume — a fresh session is the safe fallback.
+      }
+    }
+
+    if (!resumed) {
+      try {
         sessionNewResult = await conn.request("session/new", sessionParams, 60000);
-      } else {
-        throw err;
+      } catch (err: any) {
+        // Authentication required error code (-32000)
+        if (err?.code === -32000 || String(err?.message || "").includes("Authentication required")) {
+          const hasRealKey = (k?: string) =>
+            Boolean(k && k !== "acp-managed" && !k.startsWith("{") && !k.startsWith("<"));
+          const methodId =
+            hasRealKey(apiKey) || hasRealKey(process.env.GEMINI_API_KEY)
+              ? "gemini-api-key"
+              : "oauth-personal";
+          await conn.authenticate({ methodId });
+          sessionNewResult = await conn.request("session/new", sessionParams, 60000);
+        } else {
+          throw err;
+        }
       }
     }
 
@@ -647,11 +726,9 @@ export class AcpSessionPool {
       cwd,
       currentModelId: initialModelId,
       currentEffort: initialEffort,
-      systemPromptHash: systemPromptAppend
-        ? createHash("sha256").update(systemPromptAppend).digest("hex")
-        : "",
-      syncedMessageCount: 0,
-      prefixHash: "",
+      systemPromptHash,
+      syncedMessageCount: resumed && resume ? resume.syncedMessageCount : 0,
+      prefixHash: resumed && resume ? resume.prefixHash : "",
       inFlightPrompt: null,
       unbindAbort: null,
       pendingMcpBatch: null,
@@ -662,11 +739,15 @@ export class AcpSessionPool {
     this.sessions.set(sessionKey, liveSession);
     this.acpToLiveSession.set(acpSessionId, liveSession);
 
-    // Apply model & effort configuration
-    if (modelId || effort) {
+    // Apply model & effort configuration. A loaded conversation comes back on
+    // the account default model (e.g. gemini-4-argon), not the one the session
+    // recorded, so this must run on resume too — otherwise the turn is billed
+    // against whatever default bucket happens to be free.
+    if (resumed || modelId || effort) {
       await this.configureSessionModel(liveSession, modelId, effort);
     }
 
+    this.recordSessionState(sessionKey);
     return liveSession;
   }
 
@@ -1023,6 +1104,7 @@ export class AcpSessionPool {
     this.mcpBridge.removeSession(sessionKey);
     this.sessions.delete(sessionKey);
     this.acpToLiveSession.delete(session.acpSessionId);
+    this.resumeCandidates.delete(sessionKey);
   }
 
   public async closeAll(): Promise<void> {
