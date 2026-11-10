@@ -573,8 +573,14 @@ export class AcpSessionPool {
   public recordSessionState(sessionKey: string): void {
     if (!this.onSessionState) return;
     const session = this.sessions.get(sessionKey);
-    if (!session || !session.prefixHash) return;
-    this.onSessionState(sessionKey, {
+    const state = session ? this.snapshotSession(session) : null;
+    if (state) this.onSessionState(sessionKey, state);
+  }
+
+  /** A conversation is resumable once at least one turn has been checkpointed. */
+  private snapshotSession(session: LiveAcpSession): PersistedAcpSessionState | null {
+    if (!session.prefixHash) return null;
+    return {
       acpSessionId: session.acpSessionId,
       cwd: session.cwd,
       model: session.currentModelId,
@@ -582,7 +588,7 @@ export class AcpSessionPool {
       systemPromptHash: session.systemPromptHash,
       syncedMessageCount: session.syncedMessageCount,
       prefixHash: session.prefixHash,
-    });
+    };
   }
 
   /** Drop any durable handle for this session (branch switch, reset). */
@@ -1119,9 +1125,16 @@ export class AcpSessionPool {
   public evictIdleSessions(maxIdleMs: number): void {
     const now = Date.now();
     for (const [key, session] of this.sessions.entries()) {
-      if (now - session.lastUsedAt > maxIdleMs && !session.pendingMcpBatch) {
-        this.resetSession(key).catch(() => {});
-      }
+      // Never drop a conversation out from under a running turn.
+      if (session.inFlightPrompt || session.pendingMcpBatch) continue;
+      if (now - session.lastUsedAt <= maxIdleMs) continue;
+
+      // Eviction is a memory decision, not a context decision: keep the handle
+      // so the next turn reattaches with session/resume instead of replaying
+      // the transcript into a fresh session.
+      const candidate = this.snapshotSession(session);
+      this.resetSession(key).catch(() => {});
+      if (candidate) this.setResumeCandidate(key, candidate);
     }
   }
 
