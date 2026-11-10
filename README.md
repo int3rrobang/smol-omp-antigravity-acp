@@ -26,7 +26,8 @@ A smol, [`omp`](https://github.com/can1357/oh-my-pi)-native extension that overr
 - **Cache continuity**: Reuses warm ACP sessions and sends incremental message deltas to minimize cache misses, ensuring your quota doesn't get wrecked.
 - **Steering support**: Handles mid-turn user steering (text & images) and graceful cancellation drains on the active session.
 - **Dynamic model discovery**: Discovers account-accessible models and wires OMP's thinking effort toggle to ACP's.
-- **Slash commands**: `/agy-status` and `/agy-reset` for quick diagnostics and session management.
+- **Quota-aware `/usage`**: Reports Antigravity's Gemini, Claude/GPT, and Gemini Argon quota windows in OMP's native `/usage` and `omp usage` via `agy -p "/usage"`. Disable it with `OMP_AGY_USAGE_SOURCE=off`.
+- **Slash commands**: `/agy-status`, `/agy-usage`, and `/agy-reset` for diagnostics, quota-toggle control, and session management.
 
 ---
 
@@ -126,6 +127,45 @@ Inside the `omp` TUI:
 ### Slash Commands
 - `/agy-status` — Display the resolved `agy` binary path and provider status.
 - `/agy-reset` — Close all live ACP sessions and restart the background `agy acp` process.
+
+### Usage & Rate Limits
+
+The extension registers a native OMP usage provider, so `google-antigravity` quota/rate-limit state shows up in both the live `/usage` command and `omp usage`:
+
+```bash
+omp usage --provider google-antigravity
+omp usage --provider google-antigravity --json
+```
+
+The provider runs the official CLI's read-only slash command:
+
+```bash
+agy -p "/usage" --output-format json
+```
+
+That command starts no agent turn, spends zero model tokens, and is documented first-party behavior: the CLI changelog explicitly added non-interactive answers for `-p "/usage"`/`/quota` with JSON output, and later improved its timestamps for scripts. Its `groups[].buckets[]` payload is mapped into OMP's normalized `UsageReport` limits (Gemini, Claude/GPT shared, and the separate Gemini Argon window), including reset times and percentage remaining. The official binary calls its own quota backend internally; the plugin does not call Cloud Code `v1internal:*` endpoints directly.
+
+The provider checks `agy --version` and only uses print mode on `>= 1.1.11` (older binaries treat `/usage` as a model prompt). Every `agy` child gets `AGY_CLI_DISABLE_AUTO_UPDATE=true` so a passive quota probe cannot start a CLI auto-update. This mirrors the guardrails used by CodexBar's `agy` print source.
+
+The toggle is first-class and enabled by default. In the TUI:
+
+```text
+/agy-usage          # on/off selector
+/agy-usage on
+/agy-usage off
+/agy-usage status
+```
+
+The choice is persisted to `<agent-dir>/antigravity-acp-usage.json` (`PI_CODING_AGENT_DIR` when set, otherwise `~/.omp/agent`). `OMP_AGY_USAGE_SOURCE` is an environment override and wins over the saved setting:
+
+```bash
+OMP_AGY_USAGE_SOURCE=off
+```
+
+`/agy-status` shows the effective mode. No ACP-observed fallback is kept: either the official CLI query runs, or `/usage` reports nothing for this provider.
+
+> [!IMPORTANT]
+> Google's Antigravity FAQ says headless mode (`agy -p`) is intended for **direct scripting and CI workflows**, and that **wrapping `agy` inside third-party coding agents or applications is not supported under consumer plans**. The ACP path (the official unmodified `antigravity-acp` binary over JSON-RPC with native `oauth-personal` sign-in) is the path Google has explicitly described as permitted for single-user interactive development. This plugin nevertheless uses `agy -p "/usage"` as its quota source; set `OMP_AGY_USAGE_SOURCE=off` if you want to stay strictly ACP-only.
 
 ---
 

@@ -217,6 +217,113 @@ export interface OAuthLoginCallbacks {
   [key: string]: any;
 }
 
+// ============================================================================
+// Usage Reporting Types (omp provider extension hook)
+// ============================================================================
+
+export type UsageUnit = "percent" | "tokens" | "requests" | "credits" | "usd" | "minutes" | "bytes" | "unknown";
+
+export type UsageStatus = "ok" | "warning" | "exhausted" | "unknown";
+
+/** Time window for a limit (e.g. 5h, weekly, monthly). */
+export interface UsageWindow {
+  id: string;
+  label: string;
+  durationMs?: number;
+  resetsAt?: number;
+  resetLabel?: string;
+}
+
+/** Quantitative usage data. */
+export interface UsageAmount {
+  used?: number;
+  limit?: number;
+  remaining?: number;
+  usedFraction?: number;
+  remainingFraction?: number;
+  unit: UsageUnit;
+}
+
+/** Scope metadata describing what the limit applies to. */
+export interface UsageScope {
+  provider: string;
+  accountId?: string;
+  projectId?: string;
+  orgId?: string;
+  modelId?: string;
+  tier?: string;
+  windowId?: string;
+  shared?: boolean;
+  sharedGroup?: string;
+}
+
+/** Normalized limit entry for a single window or quota bucket. */
+export interface UsageLimit {
+  id: string;
+  label: string;
+  scope: UsageScope;
+  window?: UsageWindow;
+  amount: UsageAmount;
+  status?: UsageStatus;
+  notes?: string[];
+}
+
+/** Aggregated usage report for a provider. */
+export interface UsageReport {
+  provider: string;
+  fetchedAt: number;
+  limits: UsageLimit[];
+  notes?: string[];
+  metadata?: Record<string, unknown>;
+  raw?: unknown;
+}
+
+/** Credential bundle passed to a usage fetcher. */
+export interface UsageCredential {
+  type: "api_key" | "oauth";
+  apiKey?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  accountId?: string;
+  projectId?: string;
+  email?: string;
+  orgId?: string;
+}
+
+/** Parameters provided to a usage fetcher. */
+export interface UsageFetchParams {
+  provider: string;
+  credential: UsageCredential;
+  accountKey?: string;
+  baseUrl?: string;
+  signal?: AbortSignal;
+}
+
+/** Optional logger for usage fetchers. */
+export interface UsageLogger {
+  debug(message: string, meta?: Record<string, unknown>): void;
+  warn(message: string, meta?: Record<string, unknown>): void;
+}
+
+/** Shared runtime utilities for fetchers. */
+export interface UsageFetchContext {
+  logger?: UsageLogger;
+  retryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+  previousReport?: UsageReport;
+}
+
+/** Provider implementation for fetching usage information. */
+export interface UsageProvider {
+  id: string;
+  cacheVersion?: number;
+  fetchUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null>;
+  supports?(params: UsageFetchParams): boolean;
+  validatesCredentials?: boolean;
+  retainLastGoodOnFailure?: boolean;
+  failureBackoffMs?: number;
+}
+
 export interface ProviderConfig {
   baseUrl?: string;
   apiKey?: string;
@@ -233,12 +340,37 @@ export interface ProviderConfig {
     modifyModels?(models: Model<any>[], credentials: OAuthCredentials): Model<any>[];
   };
   fetchDynamicModels?: (apiKey: string | undefined) => Promise<readonly ProviderModelConfig[]>;
+  /** Normalized usage fetcher surfaced by omp's `/usage` and `omp usage`. */
+  usage?: UsageProvider;
   [key: string]: any;
+}
+
+export interface ExtensionUISelectOption {
+  label: string;
+  description?: string;
+}
+
+export interface ExtensionCommandContext {
+  ui?: {
+    notify?(message: string, type?: "info" | "warning" | "error"): void;
+    write?(text: string): void;
+    select?(
+      title: string,
+      options: Array<string | ExtensionUISelectOption>,
+    ): Promise<string | undefined>;
+  };
+}
+
+export interface ExtensionCommand {
+  description?: string;
+  handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void;
 }
 
 export interface ExtensionAPI {
   registerProvider(name: string, config: ProviderConfig): void;
   unregisterProvider(name: string): void;
+  registerCommand?(name: string, command: ExtensionCommand): void;
+  on?(event: string, handler: (...args: unknown[]) => unknown): void;
   [key: string]: any;
 }
 

@@ -8,6 +8,7 @@
 
 import {
   type ExtensionAPI,
+  type ExtensionCommandContext,
   type OAuthLoginCallbacks,
   type OAuthCredentials,
   ANTIGRAVITY_API_NAME,
@@ -16,17 +17,47 @@ import {
 } from "./src/types.ts";
 import { AcpSessionPool, resolveAgyBinary } from "./src/acp-pool.ts";
 import { streamAntigravityAcp } from "./src/stream-adapter.ts";
+import {
+  type AntigravityUsageMode,
+  antigravityAcpUsageProvider,
+  antigravityUsageConfigPath,
+  antigravityUsageEnvOverride,
+  antigravityUsageMode,
+  setAntigravityUsageMode,
+} from "./src/usage.ts";
 
 export { AcpSessionPool, resolveAgyBinary } from "./src/acp-pool.ts";
 export { streamAntigravityAcp } from "./src/stream-adapter.ts";
+export {
+  antigravityAcpUsageProvider,
+  antigravityUsageConfigPath,
+  antigravityUsageEnvOverride,
+  antigravityUsageMode,
+  parseAgyUsagePayload,
+  setAntigravityUsageMode,
+} from "./src/usage.ts";
 export * from "./src/types.ts";
+
+function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "warning" | "error" = "info"): void {
+  if (ctx.ui?.notify) {
+    ctx.ui.notify(message, type);
+  } else if (ctx.ui?.write) {
+    ctx.ui.write(`${message}\n`);
+  } else {
+    console.log(message);
+  }
+}
 
 export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void {
   // Singleton pool for this extension runtime
   const pool = new AcpSessionPool();
 
-  // Pre-warm the ACP process + MCP bridge in the background so the first turn doesn't pay cold boot cost
-  pool.ensureConnection().catch(() => {});
+  // Pre-warm the ACP process + MCP bridge when an interactive session starts,
+  // so the first turn doesn't pay cold boot cost without spawning `agy acp`
+  // from one-shot CLI commands such as `omp usage`.
+  pi.on?.("session_start", () => {
+    pool.ensureConnection().catch(() => {});
+  });
 
   // Register the provider
   pi.registerProvider(ANTIGRAVITY_PROVIDER_NAME, {
@@ -49,6 +80,7 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
     streamSimple: (model, context, options) => {
       return streamAntigravityAcp(pool, model, context, options);
     },
+    usage: antigravityAcpUsageProvider,
     models: ANTIGRAVITY_MODELS,
     fetchDynamicModels: async () => {
       return await pool.discoverModels();
@@ -58,44 +90,89 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // Slash commands
   if (typeof pi.registerCommand === "function") {
     pi.registerCommand("agy-status", {
-      description: "Show Google Antigravity ACP binary status and active session count",
-      handler: async (_args: string, ctx: any) => {
+      description: "Show Google Antigravity ACP binary status, active sessions, and usage mode",
+      handler: async (_args: string, ctx: ExtensionCommandContext) => {
         let binaryPath = "unknown";
         try {
           binaryPath = resolveAgyBinary();
-        } catch (e: any) {
-          binaryPath = `Error: ${e.message}`;
+        } catch (error) {
+          binaryPath = `Error: ${error instanceof Error ? error.message : String(error)}`;
         }
 
+        const usageMode = antigravityUsageMode();
         const msg = [
           "Google Antigravity ACP Status:",
           `• Binary: ${binaryPath}`,
           `• Provider: ${ANTIGRAVITY_PROVIDER_NAME} (${ANTIGRAVITY_API_NAME})`,
           `• Auth Mode: native ACP (OAuth / Gemini CLI)`,
+          `• Usage: ${usageMode === "cli" ? 'agy -p "/usage"' : "off"} (toggle: /agy-usage)`,
         ].join("\n");
 
-        if (ctx?.ui?.notify) {
-          ctx.ui.notify(msg, "info");
-        } else if (ctx?.ui?.write) {
-          ctx.ui.write(`${msg}\n`);
-        } else {
-          console.log(msg);
+        notify(ctx, msg, usageMode === "cli" ? "info" : "warning");
+      },
+    });
+
+    pi.registerCommand("agy-usage", {
+      description: "Toggle Antigravity quota reporting in /usage (agy -p /usage)",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const envOverride = antigravityUsageEnvOverride();
+        const verb = args.trim().toLowerCase();
+        let next: AntigravityUsageMode | undefined;
+
+        if (verb === "on" || verb === "enable" || verb === "cli") next = "cli";
+        else if (verb === "off" || verb === "disable") next = "off";
+        else if (verb && verb !== "status") {
+          notify(ctx, "Usage: /agy-usage [on|off|status]", "warning");
+          return;
         }
+
+        if (!next && !verb && ctx.ui?.select) {
+          const selected = await ctx.ui.select("Antigravity `/usage` source", [
+            { label: "On — agy -p /usage", description: "Live quota buckets in /usage" },
+            {
+              label: "Off — ACP only",
+              description: "No quota subprocess; /usage shows nothing for this provider",
+            },
+          ]);
+          if (selected?.startsWith("On")) next = "cli";
+          else if (selected?.startsWith("Off")) next = "off";
+        }
+
+        if (next) {
+          try {
+            const effective = setAntigravityUsageMode(next);
+            const lines = [
+              `Antigravity /usage: ${effective === "cli" ? "on" : "off"}.`,
+              `Saved to ${antigravityUsageConfigPath()}`,
+            ];
+            if (envOverride) {
+              lines.push(`Note: OMP_AGY_USAGE_SOURCE=${envOverride} overrides the saved setting.`);
+            }
+            notify(ctx, lines.join("\n"), effective === "cli" ? "info" : "warning");
+          } catch (error) {
+            notify(
+              ctx,
+              `Failed to save /usage setting: ${error instanceof Error ? error.message : String(error)}`,
+              "error",
+            );
+          }
+          return;
+        }
+
+        const mode = antigravityUsageMode();
+        const lines = [`Antigravity /usage: ${mode === "cli" ? "on" : "off"} (effective).`];
+        if (envOverride) lines.push(`Source: OMP_AGY_USAGE_SOURCE=${envOverride} (environment override).`);
+        else lines.push(`Config: ${antigravityUsageConfigPath()}`);
+        lines.push(mode === "cli" ? "Disable with /agy-usage off." : "Enable with /agy-usage on.");
+        notify(ctx, lines.join("\n"), mode === "cli" ? "info" : "warning");
       },
     });
 
     pi.registerCommand("agy-reset", {
       description: "Reset all live Antigravity ACP sessions and restart the ACP background process",
-      handler: async (_args: string, ctx: any) => {
+      handler: async (_args: string, ctx: ExtensionCommandContext) => {
         await pool.closeAll();
-        const msg = "All Antigravity ACP sessions and processes have been reset.";
-        if (ctx?.ui?.notify) {
-          ctx.ui.notify(msg, "info");
-        } else if (ctx?.ui?.write) {
-          ctx.ui.write(`${msg}\n`);
-        } else {
-          console.log(msg);
-        }
+        notify(ctx, "All Antigravity ACP sessions and processes have been reset.", "info");
       },
     });
   }
