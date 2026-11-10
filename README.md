@@ -9,7 +9,9 @@ A smol, [`omp`](https://github.com/can1357/oh-my-pi)-native extension that overr
 >
 > It *should* be okay. In the [Google AI Developers Forum ToS clarification thread for T3 Code](https://discuss.ai.google.dev/t/tos-clarification-is-t3-code-official-antigravity-acp-agent-permitted-under-the-antigravity-terms-of-service/192027), Google confirmed that third-party client usage is permitted for **personal, single-user interactive development** as long as it communicates over standard JSON-RPC with the official, unmodified `antigravity-acp` binary using native OAuth rather than proxying tokens or scraping endpoints (see also [T3 Code's provider guidance](https://github.com/pingdotgg/t3code/blob/main/docs/user/faq.md#will-i-get-banned-for-using-my-subscription)).
 >
-> However, I cannot guarantee Google won't get mad if they find the traffic suspicious, OR if you use it in an OpenClaw-y autonomous manner, which seems to be forbidden, OR if you don't but Google thinks you do.
+> Furthermore, the /usage implementation is quite **gray-area**. It uses `agy -p /usage`, which is greenlit for scripts and explicitly supported, but `agy -p` is blanket-banned for 3rd party coding agents. If you're wary of that, you can explicitly **disable /usage functionality** (see below.) 
+>
+> Naturally, I cannot guarantee Google won't get mad if they find the traffic suspicious, OR if you use it in an OpenClaw-y autonomous manner, which seems to be forbidden, OR if you don't but Google thinks you do.
 >
 > This extension is also entirely LLM-written, though curated to not reinvent the wheel and play nicely with `omp`. Tread carefully.
 >
@@ -128,7 +130,7 @@ Inside the `omp` TUI:
 - `/agy-status` — Display the resolved `agy` binary path and provider status.
 - `/agy-reset` — Close all live ACP sessions and restart the background `agy acp` process.
 
-### Usage & Rate Limits
+### Rate Limits in /usage
 
 The extension registers a native OMP usage provider, so `google-antigravity` quota/rate-limit state shows up in both the live `/usage` command and `omp usage`:
 
@@ -144,8 +146,6 @@ agy -p "/usage" --output-format json
 ```
 
 That command starts no agent turn, spends zero model tokens, and is documented first-party behavior: the CLI changelog explicitly added non-interactive answers for `-p "/usage"`/`/quota` with JSON output, and later improved its timestamps for scripts. Its `groups[].buckets[]` payload is mapped into OMP's normalized `UsageReport` limits (Gemini, Claude/GPT shared, and the separate Gemini Argon window), including reset times and percentage remaining. The official binary calls its own quota backend internally; the plugin does not call Cloud Code `v1internal:*` endpoints directly.
-
-The provider checks `agy --version` and only uses print mode on `>= 1.1.11` (older binaries treat `/usage` as a model prompt). Every `agy` child gets `AGY_CLI_DISABLE_AUTO_UPDATE=true` so a passive quota probe cannot start a CLI auto-update. This mirrors the guardrails used by CodexBar's `agy` print source.
 
 The toggle is first-class and enabled by default. In the TUI:
 
