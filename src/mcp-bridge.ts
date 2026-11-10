@@ -37,12 +37,18 @@ function generatePipePath(): string {
   if (process.platform === "win32") {
     return `\\\\.\\pipe\\${id}`;
   }
-  for (const dir of [os.tmpdir(), "/tmp"]) {
-    const candidate = path.join(dir, `${id}.sock`);
+  const shortId = `oam-${process.pid}-${rand}`;
+  // Shorten the name before moving out of the caller's TMPDIR: that directory
+  // may be the only writable, socket-capable place (sandboxes, private mounts).
+  const candidates = [
+    path.join(os.tmpdir(), `${id}.sock`),
+    path.join(os.tmpdir(), `${shortId}.sock`),
+    path.join("/tmp", `${id}.sock`),
+    path.join("/tmp", `${shortId}.sock`),
+  ];
+  for (const candidate of new Set(candidates)) {
     if (Buffer.byteLength(candidate) <= MAX_UNIX_SOCKET_PATH) return candidate;
   }
-  const short = path.join("/tmp", `oam-${process.pid}-${rand}.sock`);
-  if (Buffer.byteLength(short) <= MAX_UNIX_SOCKET_PATH) return short;
   throw new Error(
     `Cannot fit the Antigravity MCP socket in ${MAX_UNIX_SOCKET_PATH} bytes (unix socket limit); point TMPDIR at a shorter directory.`,
   );
