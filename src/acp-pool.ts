@@ -494,6 +494,8 @@ export class AcpSessionPool {
   private evictionInterval: NodeJS.Timeout | null = null;
   private connecting: Promise<AcpConnection> | null = null;
   private resumeCandidates = new Map<string, PersistedAcpSessionState>();
+  /** In-flight session setup per key, so concurrent turns cannot interleave it. */
+  private sessionCreations = new Map<string, Promise<unknown>>();
   /**
    * Persist (or clear, with `null`) this session's ACP handle. The host wires
    * this to `pi.appendEntry` so the handle rides along with the omp session.
@@ -589,6 +591,33 @@ export class AcpSessionPool {
   }
 
   public async createSession(
+    sessionKey: string,
+    cwd: string,
+    systemPromptAppend?: string,
+    modelId?: string,
+    effort?: string,
+    apiKey?: string,
+    hasTools: boolean = true,
+  ): Promise<LiveAcpSession> {
+    // Setup for one omp session must not interleave: every call resets the
+    // previous live session and consumes the resume handle, so two concurrent
+    // calls for the same key would tear down each other's session. Distinct
+    // keys (a main turn waking several subagents) still run concurrently.
+    const previous = this.sessionCreations.get(sessionKey);
+    const pending = (previous ? previous.catch(() => {}) : Promise.resolve()).then(() =>
+      this.createSessionNow(sessionKey, cwd, systemPromptAppend, modelId, effort, apiKey, hasTools),
+    );
+    this.sessionCreations.set(sessionKey, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.sessionCreations.get(sessionKey) === pending) {
+        this.sessionCreations.delete(sessionKey);
+      }
+    }
+  }
+
+  private async createSessionNow(
     sessionKey: string,
     cwd: string,
     systemPromptAppend?: string,
