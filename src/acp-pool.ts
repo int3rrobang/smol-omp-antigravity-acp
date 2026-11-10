@@ -480,6 +480,11 @@ export class AcpSessionPool {
 
   constructor(apiKey?: string) {
     this.mcpBridge = new McpBridgeServer();
+  }
+
+  /** Start the idle-session eviction timer only when ACP is actually in use. */
+  private ensureEvictionTimer(): void {
+    if (this.evictionInterval) return;
     // 15-minute idle eviction interval
     this.evictionInterval = setInterval(() => {
       this.evictIdleSessions(15 * 60 * 1000);
@@ -490,6 +495,7 @@ export class AcpSessionPool {
   }
 
   public async ensureConnection(apiKey?: string): Promise<AcpConnection> {
+    this.ensureEvictionTimer();
     if (this.conn && this.conn.isConnected()) {
       return this.conn;
     }
