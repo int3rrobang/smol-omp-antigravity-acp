@@ -573,6 +573,54 @@ export function getThinkingConfigForModel(modelId: string): ThinkingConfig {
   return DEFAULT_EFFORT_THINKING;
 }
 
+/**
+ * Prices (global endpoint, per 1M tokens) for models `agy` may advertise that
+ * are not in the static roster — tier-gated releases such as Gemini 4 Carbon,
+ * which a pro account is never offered. Without an entry, discovery falls back
+ * to a generic placeholder that understates anything priced like a 4-series
+ * model. Google moves these to list price on 2026-12-01 08:00 UTC, so the
+ * lookup takes the request date rather than baking one number in.
+ */
+export function antigravityModelPricing(
+  baseId: string,
+  now: number = Date.now(),
+): Pick<ProviderModelConfig, "cost" | "contextWindow" | "maxTokens"> | undefined {
+  if (baseId === "gemini-4-carbon") {
+    const atListPrice = now >= Date.parse("2026-12-01T08:00:00Z");
+    return {
+      cost: atListPrice
+        ? { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 }
+        : { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 0 },
+      contextWindow: 1048576,
+      maxTokens: 65536,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Config for an id that only exists in discovery (agy advertised it for this
+ * account). Known family prices come from {@link DISCOVERED_MODEL_PRICING}.
+ */
+export function antigravityDiscoveredModel(baseId: string, name?: string): ProviderModelConfig {
+  // Callers pass ids straight from agy, which advertises one row per thinking
+  // level (`…-low/-medium/-high`); collapse them onto the family id.
+  const id = baseId.replace(/-(low|medium|high)$/i, "");
+  const known = antigravityModelPricing(id);
+  return {
+    id,
+    name: (name || baseId).replace(/\s*\((Low|Medium|High)\)\s*$/i, ""),
+    api: ANTIGRAVITY_API_NAME,
+    reasoning: true,
+    thinking: getThinkingConfigForModel(baseId),
+    supportsTools: true,
+    input: ["text", "image"],
+    contextWindow: known?.contextWindow ?? 1048576,
+    maxTokens: known?.maxTokens ?? 65536,
+    cost: known?.cost ?? { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0 },
+  };
+}
+
 export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
   {
     id: "gemini-3.8-flash",

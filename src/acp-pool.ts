@@ -17,9 +17,8 @@ import {
   type ProviderModelConfig,
   type OAuthLoginCallbacks,
   type OAuthCredentials,
-  ANTIGRAVITY_API_NAME,
   ANTIGRAVITY_MODELS,
-  getThinkingConfigForModel,
+  antigravityDiscoveredModel,
 } from "./types.ts";
 import { McpBridgeServer } from "./mcp-bridge.ts";
 
@@ -1073,18 +1072,7 @@ export class AcpSessionPool {
             // Strip any redundant -low/-medium/-high suffix so only canonical models appear in picker
             const id = rawId.replace(/-(low|medium|high)$/i, "");
             if (id && !modelsMap.has(id)) {
-              modelsMap.set(id, {
-                id,
-                name: (opt.name || id).replace(/\s*\((Low|Medium|High)\)\s*$/i, ""),
-                api: ANTIGRAVITY_API_NAME,
-                reasoning: true,
-                thinking: getThinkingConfigForModel(id),
-                supportsTools: true,
-                input: ["text", "image"],
-                contextWindow: 1048576,
-                maxTokens: 65536,
-                cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0 },
-              });
+              modelsMap.set(id, antigravityDiscoveredModel(id, opt.name));
             }
           }
         }
@@ -1097,18 +1085,7 @@ export class AcpSessionPool {
           if (!rawId) continue;
           const baseId = rawId.replace(/-(low|medium|high)$/i, "");
           if (baseId && !modelsMap.has(baseId)) {
-            modelsMap.set(baseId, {
-              id: baseId,
-              name: String(m.name || baseId).replace(/\s*\((Low|Medium|High)\)\s*$/i, ""),
-              api: ANTIGRAVITY_API_NAME,
-              reasoning: true,
-              thinking: getThinkingConfigForModel(baseId),
-              supportsTools: true,
-              input: ["text", "image"],
-              contextWindow: 1048576,
-              maxTokens: 65536,
-              cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0 },
-            });
+            modelsMap.set(baseId, antigravityDiscoveredModel(baseId, m.name));
           }
         }
       }
