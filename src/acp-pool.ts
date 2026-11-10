@@ -477,6 +477,7 @@ export class AcpSessionPool {
   private acpToLiveSession = new Map<string, LiveAcpSession>();
   private lastSessionNewResult: any = null;
   private evictionInterval: NodeJS.Timeout | null = null;
+  private connecting: Promise<AcpConnection> | null = null;
 
   constructor(apiKey?: string) {
     this.mcpBridge = new McpBridgeServer();
@@ -494,12 +495,23 @@ export class AcpSessionPool {
     }
   }
 
-  public async ensureConnection(apiKey?: string): Promise<AcpConnection> {
+  public ensureConnection(apiKey?: string): Promise<AcpConnection> {
     this.ensureEvictionTimer();
     if (this.conn && this.conn.isConnected()) {
-      return this.conn;
+      return Promise.resolve(this.conn);
     }
 
+    // Single-flight: concurrent createSession calls (main turn + agents) must
+    // share one agy process, not spawn one each.
+    if (!this.connecting) {
+      this.connecting = this.openConnection(apiKey).finally(() => {
+        this.connecting = null;
+      });
+    }
+    return this.connecting;
+  }
+
+  private async openConnection(apiKey?: string): Promise<AcpConnection> {
     if (this.conn) {
       await this.conn.close();
       this.conn = null;

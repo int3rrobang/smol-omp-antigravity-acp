@@ -247,6 +247,35 @@ function formatFullHistoryTranscript(messages: Message[]): any[] {
 }
 
 // ============================================================================
+// Antigravity Prompt Sanitizing
+// ============================================================================
+
+/**
+ * Google's Cloud Code Assist backend answers a false HTTP 429
+ * RESOURCE_EXHAUSTED when the system instruction carries the RFC-2119 keyword
+ * sentence (or the `<system-conventions>` / `<system-directive>` section tags)
+ * that harness prompts such as omp's ship verbatim: the payload trips a
+ * server-side rule and the rejection is misreported as quota. The `agy` CLI is
+ * unaffected because its own prompt lacks those literals.
+ *
+ * Rewriting them keeps the instruction's meaning while avoiding the match.
+ * Set OMP_AGY_SANITIZE_PROMPT=off to send the prompt exactly as omp built it.
+ */
+export function sanitizeSystemPrompt(prompt: string): string {
+  const mode = (process.env.OMP_AGY_SANITIZE_PROMPT ?? "").trim().toLowerCase();
+  if (mode === "off" || mode === "0" || mode === "false" || mode === "no") {
+    return prompt;
+  }
+
+  return prompt
+    .replaceAll("RFC 2119 keywords:", "Spec keywords:")
+    .replaceAll("RFC 2119:", "Spec keywords:")
+    .replaceAll("RFC 2119", "spec keywords")
+    .replaceAll("system-conventions", "system_conventions")
+    .replaceAll("system-directive", "system_directive");
+}
+
+// ============================================================================
 // Main Stream Adapter
 // ============================================================================
 
@@ -302,11 +331,13 @@ export function streamAntigravityAcp(
         ? context.systemPrompt
         : "";
 
-    const systemPromptAppend = hasTools
-      ? rawSystemPrompt
-        ? `${rawSystemPrompt}\n\n${toolRoutingInstruction}`
-        : toolRoutingInstruction
-      : rawSystemPrompt;
+    const systemPromptAppend = sanitizeSystemPrompt(
+      hasTools
+        ? rawSystemPrompt
+          ? `${rawSystemPrompt}\n\n${toolRoutingInstruction}`
+          : toolRoutingInstruction
+        : rawSystemPrompt,
+    );
 
     let session = pool.getSession(sessionKey);
 

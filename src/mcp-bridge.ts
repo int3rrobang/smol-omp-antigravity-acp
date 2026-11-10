@@ -45,6 +45,8 @@ export class McpBridgeServer {
   private listening = false;
   private sessions = new Map<string, SessionState>();
   private sockets = new Set<net.Socket>();
+  /** In-flight listen, so concurrent callers share one server instead of racing the pipe. */
+  private startPromise: Promise<string> | null = null;
 
   constructor(customPipePath?: string) {
     this.pipePath = customPipePath || generatePipePath();
@@ -118,11 +120,28 @@ export class McpBridgeServer {
   }
 
   public start(): Promise<string> {
+    // Single-flight: two concurrent createSession calls both used to reach
+    // listen() before `listening` flipped, and the second one died with
+    // EADDRINUSE on its own pipe.
+    if (this.listening) return Promise.resolve(this.pipePath);
+    if (this.startPromise) return this.startPromise;
+
+    const pending = this.listen().then(
+      (path) => {
+        this.startPromise = null;
+        return path;
+      },
+      (err) => {
+        this.startPromise = null;
+        throw err;
+      },
+    );
+    this.startPromise = pending;
+    return pending;
+  }
+
+  private listen(): Promise<string> {
     return new Promise((resolve, reject) => {
-      if (this.server && this.listening) {
-        resolve(this.pipePath);
-        return;
-      }
 
       if (process.platform !== "win32") {
         try {
@@ -178,6 +197,7 @@ export class McpBridgeServer {
   }
 
   public stop(): Promise<void> {
+    this.startPromise = null;
     return new Promise((resolve) => {
       for (const session of this.sessions.values()) {
         if (session.batchTimer) {
