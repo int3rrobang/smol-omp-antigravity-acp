@@ -23,13 +23,29 @@ export function sanitizeInputSchema(parameters: any): Record<string, any> {
   return schema;
 }
 
+/**
+ * Unix sockets live in `sun_path`, which is 108 bytes on Linux and 104 on macOS,
+ * terminator included. Bun happily binds and connects beyond that, but a
+ * Node-based client cannot — and a socket nobody can connect to means the relay
+ * silently loses every tool, with no error anywhere.
+ */
+const MAX_UNIX_SOCKET_PATH = 100;
+
 function generatePipePath(): string {
   const rand = Math.random().toString(36).slice(2, 8);
   const id = `omp-agy-mcp-${process.pid}-${Date.now()}-${rand}`;
   if (process.platform === "win32") {
     return `\\\\.\\pipe\\${id}`;
   }
-  return path.join(os.tmpdir(), `${id}.sock`);
+  for (const dir of [os.tmpdir(), "/tmp"]) {
+    const candidate = path.join(dir, `${id}.sock`);
+    if (Buffer.byteLength(candidate) <= MAX_UNIX_SOCKET_PATH) return candidate;
+  }
+  const short = path.join("/tmp", `oam-${process.pid}-${rand}.sock`);
+  if (Buffer.byteLength(short) <= MAX_UNIX_SOCKET_PATH) return short;
+  throw new Error(
+    `Cannot fit the Antigravity MCP socket in ${MAX_UNIX_SOCKET_PATH} bytes (unix socket limit); point TMPDIR at a shorter directory.`,
+  );
 }
 
 interface SessionState {
@@ -142,6 +158,14 @@ export class McpBridgeServer {
 
   private listen(): Promise<string> {
     return new Promise((resolve, reject) => {
+      if (process.platform !== "win32" && Buffer.byteLength(this.pipePath) > MAX_UNIX_SOCKET_PATH) {
+        reject(
+          new Error(
+            `MCP bridge socket path is ${Buffer.byteLength(this.pipePath)} bytes, over the ${MAX_UNIX_SOCKET_PATH}-byte unix limit: ${this.pipePath}`,
+          ),
+        );
+        return;
+      }
 
       if (process.platform !== "win32") {
         try {
