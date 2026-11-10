@@ -189,6 +189,12 @@ export class AcpConnection {
       if (!child.stdout || !child.stdin) {
         throw new Error("Failed to initialize stdin/stdout pipes for agy acp");
       }
+      // Async pipe errors (EPIPE once agy is gone) arrive as 'error' events,
+      // not synchronous throws — without these listeners they are fatal.
+      child.stdin.on("error", () => {
+        // Per-write callbacks below observe failures; nothing to do here.
+      });
+      child.stdout.on("error", () => {});
 
       const rl = readline.createInterface({
         input: child.stdout,
@@ -223,6 +229,25 @@ export class AcpConnection {
     return this.initPromise;
   }
 
+  /**
+   * Best-effort JSON-RPC line write. Returns false when the pipe is already
+   * gone. Async failures (EPIPE) arrive via the write callback, never as a
+   * throw — the callback keeps them from becoming uncaught exceptions.
+   */
+  private writeStdin(payload: string, onError?: (err: Error) => void): boolean {
+    const stdin = this.child?.stdin;
+    if (!this.isConnected() || !stdin || stdin.destroyed) return false;
+    try {
+      stdin.write(payload, (err) => {
+        if (err) onError?.(err);
+      });
+      return true;
+    } catch (err) {
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+      return false;
+    }
+  }
+
   public request(method: string, params?: any, timeoutMs = 60000): Promise<any> {
     if (!this.isConnected() || !this.child?.stdin) {
       return Promise.reject(new Error("ACP process is not connected"));
@@ -247,12 +272,22 @@ export class AcpConnection {
 
       this.pendingRequests.set(id, { resolve, reject, timer });
 
-      try {
-        this.child!.stdin!.write(payload);
-      } catch (err) {
+      const onWriteError = (err: Error) => {
         if (timer) clearTimeout(timer);
         this.pendingRequests.delete(id);
         reject(err);
+      };
+
+      // writeStdin reports sync AND async (EPIPE) failures via onWriteError.
+      // When the pipe is already gone writeStdin returns false without
+      // calling back — reject now instead of hanging until timeout
+      // (session/prompt uses timeout 0, i.e. it would hang forever).
+      // If onWriteError already ran (sync throw) the entry is deleted,
+      // so the has() guard also prevents a double reject.
+      if (!this.writeStdin(payload, onWriteError) && this.pendingRequests.has(id)) {
+        if (timer) clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        reject(new Error(`ACP request '${method}' failed: pipe closed`));
       }
     });
   }
@@ -266,9 +301,7 @@ export class AcpConnection {
       method,
       params,
     }) + "\n";
-    try {
-      this.child.stdin.write(payload);
-    } catch {}
+    this.writeStdin(payload);
   }
 
   public sendResponse(id: number | string, result: any): void {
@@ -278,9 +311,7 @@ export class AcpConnection {
       id,
       result,
     }) + "\n";
-    try {
-      this.child.stdin.write(payload);
-    } catch {}
+    this.writeStdin(payload);
   }
 
   public sendError(id: number | string, code: number, message: string, data?: any): void {
@@ -290,9 +321,7 @@ export class AcpConnection {
       id,
       error: { code, message, data },
     }) + "\n";
-    try {
-      this.child.stdin.write(payload);
-    } catch {}
+    this.writeStdin(payload);
   }
 
   private handleIncomingLine(line: string): void {
@@ -800,6 +829,10 @@ export class AcpSessionPool {
       }
       this.unbindAbortSignal(session);
     });
+    // Pool-owned fork: the adapter handles the original promise, so mark this
+    // one handled here. Otherwise closeAll() settling it mid-turn escapes as
+    // an unhandled rejection and kills the host process.
+    tracked.catch(() => {});
     session.inFlightPrompt = tracked;
 
     this.bindAbortSignal(session, signal);
@@ -980,6 +1013,9 @@ export class AcpSessionPool {
     }
 
     for (const session of this.sessions.values()) {
+      // Detach listeners first: the process is going away, so late prompt
+      // settlements must not surface as provider errors on dead streams.
+      session.eventListener = null;
       this.abortPendingMcpBatch(session);
     }
     this.sessions.clear();
