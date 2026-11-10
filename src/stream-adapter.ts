@@ -275,6 +275,47 @@ export function sanitizeSystemPrompt(prompt: string): string {
     .replaceAll("system-directive", "system_directive");
 }
 
+/** Shape shared by `usage_update` events and the `session/prompt` result. */
+interface AcpUsageSnapshot {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  thoughtTokens?: number;
+}
+
+/**
+ * Fold a usage snapshot into the partial message. agy reports the authoritative
+ * totals on the `session/prompt` result and only occasionally emits interim
+ * `usage_update` events, so both paths share this mapping — without the final
+ * one, short turns record zero tokens and no cost. `outputTokens` already
+ * includes thinking tokens, so thoughts must not be added again.
+ */
+function applyUsage(
+  partial: AssistantMessage,
+  usage: AcpUsageSnapshot | undefined,
+  model: Model<any>,
+): void {
+  if (!usage) return;
+
+  const u = (partial.usage = partial.usage ?? createEmptyUsage());
+  u.input = usage.inputTokens ?? u.input;
+  u.output = usage.outputTokens ?? u.output;
+  u.cacheRead = usage.cachedReadTokens ?? u.cacheRead;
+  u.cacheWrite = usage.cachedWriteTokens ?? u.cacheWrite;
+  u.totalTokens = u.input + u.output;
+
+  if (!model.cost) return;
+  u.cost = {
+    input: (u.input / 1_000_000) * (model.cost.input ?? 0),
+    output: (u.output / 1_000_000) * (model.cost.output ?? 0),
+    cacheRead: (u.cacheRead / 1_000_000) * (model.cost.cacheRead ?? 0),
+    cacheWrite: (u.cacheWrite / 1_000_000) * (model.cost.cacheWrite ?? 0),
+    total: 0,
+  };
+  u.cost.total = u.cost.input + u.cost.output + u.cost.cacheRead + u.cost.cacheWrite;
+}
+
 // ============================================================================
 // Main Stream Adapter
 // ============================================================================
@@ -412,25 +453,7 @@ export function streamAntigravityAcp(
             partial,
           });
         } else if (ev.type === "usage") {
-          partial.usage = partial.usage || createEmptyUsage();
-          partial.usage.input = ev.inputTokens ?? partial.usage.input;
-          partial.usage.output = ev.outputTokens ?? partial.usage.output;
-          partial.usage.cacheRead = ev.cachedReadTokens ?? partial.usage.cacheRead;
-          partial.usage.totalTokens = partial.usage.input + partial.usage.output;
-
-          if (model.cost) {
-            partial.usage.cost = {
-              input: (partial.usage.input / 1000000) * (model.cost.input ?? 0),
-              output: (partial.usage.output / 1000000) * (model.cost.output ?? 0),
-              cacheRead: (partial.usage.cacheRead / 1000000) * (model.cost.cacheRead ?? 0),
-              cacheWrite: 0,
-              total: 0,
-            };
-            partial.usage.cost.total =
-              partial.usage.cost.input +
-              partial.usage.cost.output +
-              partial.usage.cost.cacheRead;
-          }
+          applyUsage(partial, ev, model);
         } else if (ev.type === "mcp_tool_calls_ready") {
           closeCurrentBlock();
 
@@ -483,6 +506,9 @@ export function streamAntigravityAcp(
           stream.end();
         } else if (ev.type === "prompt_done") {
           closeCurrentBlock();
+          // Authoritative totals for the turn — the interim usage_update stream
+          // is sparse, so most turns only ever get their numbers here.
+          applyUsage(partial, ev.usage, model);
 
           partial.stopReason = "stop";
           activeSession.syncedMessageCount = context.messages.length + 1;

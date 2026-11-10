@@ -1000,6 +1000,7 @@ export class AcpSessionPool {
         inputTokens: update.inputTokens ?? 0,
         outputTokens: update.outputTokens ?? 0,
         cachedReadTokens: update.cachedTokens ?? update.cacheReadTokens,
+        cachedWriteTokens: update.cachedWriteTokens,
         thoughtTokens: update.thoughtsTokens ?? update.thoughtTokens,
       });
     }
