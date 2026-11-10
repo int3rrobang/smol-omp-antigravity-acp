@@ -100,10 +100,11 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
     });
   }
 
-  // Graceful shutdown on session end
-  if (typeof (pi as any).on === "function") {
-    (pi as any).on("session_shutdown", async () => {
+  // Graceful shutdown on session end (never throw out of teardown:
+  // an unhandled rejection here takes down the whole host process).
+  pi.on?.("session_shutdown", async () => {
+    try {
       await pool.closeAll();
-    });
-  }
+    } catch {}
+  });
 }
