@@ -82,6 +82,10 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // subagent sessions run without a session manager here.
   let mainSessionId: string | undefined;
 
+  pool.onWarning = (message) => {
+    pi.logger?.warn?.(message);
+  };
+
   pool.onSessionState = (sessionKey, state) => {
     if (!mainSessionId || sessionKey !== mainSessionId) return;
     try {

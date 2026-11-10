@@ -27,6 +27,11 @@ import { McpBridgeServer } from "./mcp-bridge.ts";
 // 1. Binary Discovery
 // ============================================================================
 
+/** Extract a message from anything a rejected ACP request can throw. */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export function resolveAgyBinary(): string {
   // 1. Explicit override via environment
   if (process.env.OMP_AGY_BINARY && fs.existsSync(process.env.OMP_AGY_BINARY)) {
@@ -501,6 +506,8 @@ export class AcpSessionPool {
    * this to `pi.appendEntry` so the handle rides along with the omp session.
    */
   public onSessionState?: (sessionKey: string, state: PersistedAcpSessionState | null) => void;
+  /** Non-fatal problems worth showing the user (e.g. a model switch agy rejected). */
+  public onWarning?: (message: string) => void;
 
   constructor(apiKey?: string) {
     this.mcpBridge = new McpBridgeServer();
@@ -830,6 +837,7 @@ export class AcpSessionPool {
 
     // 1. Primary ACP configuration via session/set_config_option ("model" + "thought_level")
     let modelConfigSet = false;
+    let switchError: string | undefined;
     if (baseModelId && session.currentModelId !== baseModelId) {
       try {
         const res = await this.conn.request("session/set_config_option", {
@@ -847,7 +855,9 @@ export class AcpSessionPool {
             session.currentEffort = String(thoughtOpt.currentValue).toLowerCase();
           }
         }
-      } catch {}
+      } catch (err) {
+        switchError = errorMessage(err);
+      }
     } else {
       modelConfigSet = true;
     }
@@ -886,13 +896,34 @@ export class AcpSessionPool {
             sessionId: session.acpSessionId,
             modelId: candidateId,
           });
+          modelConfigSet = true;
           break;
-        } catch {}
+        } catch (err) {
+          switchError = errorMessage(err);
+        }
       }
     }
 
+    if (!modelConfigSet && baseModelId) {
+      const reason = switchError ?? "no matching model configuration method";
+      // The picker can outlive a model — omp unions dynamic discovery onto the
+      // static roster, so a retired id stays selectable. Continuing silently on
+      // the previous model is worse than saying which model actually ran.
+      if (/unknown model|not found|unsupported|invalid/i.test(reason)) {
+        const available = this.advertisedModelIds();
+        throw new Error(
+          `Antigravity does not serve model "${baseModelId}" (${reason}).` +
+            (available.length ? ` Available: ${available.join(", ")}.` : ""),
+        );
+      }
+      this.onWarning?.(
+        `Antigravity model switch to "${baseModelId}" failed (${reason}); continuing on "${session.currentModelId}".`,
+      );
+      return;
+    }
+
     session.currentModelId = baseModelId;
-    session.currentEffort = mappedEffort;
+    if (mappedEffort) session.currentEffort = mappedEffort;
   }
 
   public bindAbortSignal(session: LiveAcpSession, signal?: AbortSignal): void {
@@ -1002,6 +1033,23 @@ export class AcpSessionPool {
     } catch (err: any) {
       throw new Error(`Google Antigravity authentication failed: ${err?.message || String(err)}`);
     }
+  }
+
+  /** Canonical model ids agy advertised for this account in the last `session/new`. */
+  private advertisedModelIds(): string[] {
+    const result: any = this.lastSessionNewResult;
+    if (!result) return [];
+    const ids = new Set<string>();
+    const modelOpt = (result.configOptions ?? []).find((opt: any) => opt.id === "model");
+    for (const opt of modelOpt?.options ?? []) {
+      const id = String(opt.value ?? opt.id ?? "").trim().replace(/-(low|medium|high)$/i, "");
+      if (id) ids.add(id);
+    }
+    for (const m of result.models?.availableModels ?? []) {
+      const id = String(m.modelId ?? m.id ?? "").trim().replace(/-(low|medium|high)$/i, "");
+      if (id) ids.add(id);
+    }
+    return [...ids];
   }
 
   public async discoverModels(): Promise<ProviderModelConfig[]> {
