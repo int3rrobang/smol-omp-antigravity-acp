@@ -127,7 +127,8 @@ Inside the `omp` TUI:
 - If your `agy` CLI is not logged in yet, run `omp login google-antigravity` to trigger `agy`'s OAuth flow.
 
 ### Slash Commands
-- `/agy-status` — Display the resolved `agy` binary path and provider status.
+- `/agy-status` — Display the resolved `agy` binary path, provider status, and the effective `/usage` mode.
+- `/agy-usage [on|off|status]` — Toggle the `agy -p "/usage"` quota probe, or print which mode is in effect. Run it bare for an on/off selector.
 - `/agy-reset` — Close all live ACP sessions and restart the background `agy acp` process.
 
 ### Rate Limits in /usage
@@ -147,13 +148,13 @@ agy -p "/usage" --output-format json
 
 That command starts no agent turn, spends zero model tokens, and is documented first-party behavior: the CLI changelog explicitly added non-interactive answers for `-p "/usage"`/`/quota` with JSON output, and later improved its timestamps for scripts. Its `groups[].buckets[]` payload is mapped into OMP's normalized `UsageReport` limits (Gemini, Claude/GPT shared, and the separate Gemini Argon window), including reset times and percentage remaining. The official binary calls its own quota backend internally; the plugin does not call Cloud Code `v1internal:*` endpoints directly.
 
-The toggle is first-class and enabled by default. In the TUI:
+The toggle is first-class and **enabled by default**. Run it bare for a selector, or pass a verb (`on`/`enable`/`cli`, `off`/`disable`, `status`):
 
 ```text
-/agy-usage          # on/off selector
-/agy-usage on
-/agy-usage off
-/agy-usage status
+/agy-usage            # on/off selector
+/agy-usage on         # enable the agy print-mode quota probe
+/agy-usage off        # ACP only; /usage shows nothing for this provider
+/agy-usage status     # effective mode, config path, and any env override
 ```
 
 The choice is persisted to `<agent-dir>/antigravity-acp-usage.json` (`PI_CODING_AGENT_DIR` when set, otherwise `~/.omp/agent`). `OMP_AGY_USAGE_SOURCE` is an environment override and wins over the saved setting:
