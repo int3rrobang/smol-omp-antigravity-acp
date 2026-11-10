@@ -124,7 +124,7 @@ Inside the `omp` TUI:
 - Open the model selector (`/model`) and pick any `google-antigravity/*` model.
 - Use `omp`'s native thinking effort toggle (`low` / `medium` / `high`) to switch `agy`'s `thought_level` on the fly.
 - Assign `google-antigravity/*` models to subagent roles or invoke them with `^google-antigravity/gemini-3.8-flash` via `omp`'s `task` tool just like any built-in provider.
-- If your `agy` CLI is not logged in yet, run `omp login google-antigravity` to trigger `agy`'s OAuth flow.
+- If `agy` isn't signed in yet, sign in through `agy` itself (run `agy` once, or use the Antigravity IDE). This extension reuses agy's own keyring credentials and never stores a Google token. `omp login google-antigravity` also works — with the extension loaded it drives agy's native `oauth-personal` ACP handshake and omp records only the placeholder `acp-managed` credential, so model traffic still flows through `agy`. Give the browser sign-in a minute: the handshake times out after 120s.
 
 ### Slash Commands
 - `/agy-status` — Display the resolved `agy` binary path, provider status, and the effective `/usage` mode.
