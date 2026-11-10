@@ -15,7 +15,7 @@ import {
   ANTIGRAVITY_PROVIDER_NAME,
   ANTIGRAVITY_MODELS,
 } from "./src/types.ts";
-import { AcpSessionPool, resolveAgyBinary } from "./src/acp-pool.ts";
+import { AcpSessionPool, resolveAgyBinary, type PersistedAcpSessionState } from "./src/acp-pool.ts";
 import { streamAntigravityAcp } from "./src/stream-adapter.ts";
 import {
   type AntigravityUsageMode,
@@ -38,6 +38,32 @@ export {
 } from "./src/usage.ts";
 export * from "./src/types.ts";
 
+/**
+ * Session entry that carries the live ACP handle across processes. omp's
+ * extension docs ("Session and state patterns") prescribe `appendEntry` +
+ * `ctx.sessionManager.getBranch()` for durable extension state, so the handle
+ * rides with the session file: it survives --continue/--resume and follows
+ * branch switches instead of living in a sidecar keyed by session id.
+ */
+const SESSION_STATE_ENTRY = "smol.omp-antigravity-acp.session";
+
+interface SessionBranchEntry {
+  type?: string;
+  customType?: string;
+  data?: unknown;
+}
+
+interface SessionManagerLike {
+  getSessionId?: () => string;
+  getBranch?: () => SessionBranchEntry[];
+}
+
+function sessionManagerOf(ctx: unknown): SessionManagerLike | undefined {
+  if (!ctx || typeof ctx !== "object" || !("sessionManager" in ctx)) return undefined;
+  const manager = ctx.sessionManager;
+  return manager && typeof manager === "object" ? (manager as SessionManagerLike) : undefined;
+}
+
 function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "warning" | "error" = "info"): void {
   if (ctx.ui?.notify) {
     ctx.ui.notify(message, type);
@@ -52,12 +78,55 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // Singleton pool for this extension runtime
   const pool = new AcpSessionPool();
 
+  // Only the session this extension was registered for gets a durable handle;
+  // subagent sessions run without a session manager here.
+  let mainSessionId: string | undefined;
+
+  pool.onSessionState = (sessionKey, state) => {
+    if (!mainSessionId || sessionKey !== mainSessionId) return;
+    try {
+      pi.appendEntry?.(SESSION_STATE_ENTRY, { sessionKey, state });
+    } catch {}
+  };
+
+  const restoreResumeCandidate = (ctx: unknown): void => {
+    const manager = sessionManagerOf(ctx);
+    const sessionId = manager?.getSessionId?.();
+    if (!sessionId) return;
+    mainSessionId = sessionId;
+
+    let latest: PersistedAcpSessionState | null = null;
+    for (const entry of manager?.getBranch?.() ?? []) {
+      if (entry?.type !== "custom" || entry.customType !== SESSION_STATE_ENTRY) continue;
+      const data = entry.data as
+        | { sessionKey?: string; state?: PersistedAcpSessionState | null }
+        | undefined;
+      if (data?.sessionKey && data.sessionKey !== sessionId) continue;
+      latest = data?.state ?? null;
+    }
+    pool.setResumeCandidate(sessionId, latest);
+  };
+
+  // A branch forks the transcript, but the live ACP conversation carries the
+  // original continuation — reattaching it on the new branch would splice in
+  // turns the branch does not have, so drop the handle instead.
+  const dropResumeCandidate = (_event: unknown, ctx: unknown): void => {
+    const sessionId = mainSessionId ?? sessionManagerOf(ctx)?.getSessionId?.();
+    if (!sessionId) return;
+    pool.setResumeCandidate(sessionId, null);
+    pool.clearPersistedSession(sessionId);
+  };
+
   // Pre-warm the ACP process + MCP bridge when an interactive session starts,
   // so the first turn doesn't pay cold boot cost without spawning `agy acp`
-  // from one-shot CLI commands such as `omp usage`.
-  pi.on?.("session_start", () => {
+  // from one-shot CLI commands such as `omp usage`. Also restore the handle of
+  // a conversation agy may still be holding from an earlier process.
+  pi.on?.("session_start", (_event, ctx) => {
+    restoreResumeCandidate(ctx);
     pool.ensureConnection().catch(() => {});
   });
+  pi.on?.("session_branch", dropResumeCandidate);
+  pi.on?.("session_tree", dropResumeCandidate);
 
   // Register the provider
   pi.registerProvider(ANTIGRAVITY_PROVIDER_NAME, {
