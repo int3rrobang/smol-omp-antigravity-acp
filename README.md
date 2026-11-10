@@ -123,6 +123,7 @@ omp --model google-antigravity/gemini-3.8-flash
 
 Inside the `omp` TUI:
 - Open the model selector (`/model`) and pick any `google-antigravity/*` model.
+- The roster is discovered from what `agy` advertises for your account, so a model released to another tier appears (or stays hidden) without an extension update. `omp` also lists its own bundled `google-antigravity` entries — those use the built-in Gemini CLI transport, not this extension's ACP path, and need Gemini CLI sign-in.
 - Use `omp`'s native thinking effort toggle (`low` / `medium` / `high`) to switch `agy`'s `thought_level` on the fly.
 - Assign `google-antigravity/*` models to subagent roles or invoke them with `^google-antigravity/gemini-3.8-flash` via `omp`'s `task` tool just like any built-in provider.
 - If `agy` isn't signed in yet, sign in through `agy` itself (run `agy` once, or use the Antigravity IDE). This extension reuses agy's own keyring credentials and never stores a Google token. `omp login google-antigravity` also works — with the extension loaded it drives agy's native `oauth-personal` ACP handshake and omp records only the placeholder `acp-managed` credential, so model traffic still flows through `agy`. Give the browser sign-in a minute: the handshake times out after 120s.
