@@ -55,6 +55,8 @@ export interface Usage {
   cacheRead: number;
   cacheWrite: number;
   totalTokens: number;
+  /** Thinking tokens, reported separately from `output` for display. */
+  reasoningTokens?: number;
   cost: ModelCost;
 }
 
@@ -65,6 +67,7 @@ export function createEmptyUsage(): Usage {
     cacheRead: 0,
     cacheWrite: 0,
     totalTokens: 0,
+    reasoningTokens: 0,
     cost: {
       input: 0,
       output: 0,

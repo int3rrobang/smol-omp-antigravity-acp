@@ -303,7 +303,10 @@ function applyUsage(
   u.output = usage.outputTokens ?? u.output;
   u.cacheRead = usage.cachedReadTokens ?? u.cacheRead;
   u.cacheWrite = usage.cachedWriteTokens ?? u.cacheWrite;
-  u.totalTokens = u.input + u.output;
+  // omp totals every billed bucket, and surfaces thinking separately. agy
+  // already counts thoughts inside `outputTokens`, so this is display only.
+  u.totalTokens = u.input + u.output + u.cacheRead + u.cacheWrite;
+  if (usage.thoughtTokens) u.reasoningTokens = usage.thoughtTokens;
 
   if (!model.cost) return;
   u.cost = {
