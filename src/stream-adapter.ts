@@ -308,7 +308,9 @@ export function formatFullHistoryTranscript(messages: Message[]): any[] {
   }
 
   const blocks: any[] = [];
-  let transcript = "The following is a transcript of previous turns in this conversation:\n\n";
+  let transcript =
+    "These are your own earlier messages in this conversation, for context only. " +
+    "Do not summarize or describe this history. The user's current request is the final message below.\n\n";
 
   const flush = () => {
     if (transcript) {
@@ -367,7 +369,7 @@ export function formatFullHistoryTranscript(messages: Message[]): any[] {
       addContent("[System Instruction]:\n", msg.content);
     }
   }
-  addText("---\nContinue the conversation responding to the user below.\n\n");
+  addText("--- END OF EARLIER MESSAGES ---\nThe user's current request follows. Answer it directly.\n\n");
   flush();
 
   blocks.push(...messagesToContentBlocks(messages.slice(lastUserIdx)));
