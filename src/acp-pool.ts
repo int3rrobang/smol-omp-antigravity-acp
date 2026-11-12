@@ -512,6 +512,8 @@ export class AcpSessionPool {
   private evictionInterval: NodeJS.Timeout | null = null;
   private connecting: Promise<AcpConnection> | null = null;
   private resumeCandidates = new Map<string, PersistedAcpSessionState>();
+  /** omp's tokenizer estimate for the session, captured outside the stream. */
+  private ompContextTokens = new Map<string, number>();
   /** In-flight session setup per key, so concurrent turns cannot interleave it. */
   private sessionCreations = new Map<string, Promise<unknown>>();
   /**
@@ -587,6 +589,18 @@ export class AcpSessionPool {
   public markStale(sessionKey: string): void {
     const session = this.sessions.get(sessionKey);
     if (session) session.stale = true;
+  }
+
+  public setOmpContextTokens(sessionKey: string, tokens: number | null | undefined): void {
+    if (tokens !== undefined && tokens !== null && Number.isFinite(tokens) && tokens > 0) {
+      this.ompContextTokens.set(sessionKey, Math.floor(tokens));
+    } else {
+      this.ompContextTokens.delete(sessionKey);
+    }
+  }
+
+  public getOmpContextTokens(sessionKey: string): number | undefined {
+    return this.ompContextTokens.get(sessionKey);
   }
 
   /** Offer a previously persisted handle; `null` means "nothing to reattach to". */

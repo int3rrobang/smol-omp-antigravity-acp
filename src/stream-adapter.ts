@@ -549,7 +549,7 @@ export function streamAntigravityAcp(
 
   // Run the async turn logic in background IIFE
   (async () => {
-    const estimatedContextTokens = estimateContextTokens(context);
+    const heuristicContextTokens = estimateContextTokens(context);
     const partial: AssistantMessage = {
       role: "assistant",
       content: [],
@@ -608,6 +608,10 @@ export function streamAntigravityAcp(
     const sessionKey = isSideRequest
       ? `side:${requestedSessionId ?? "anon"}:${++ephemeralCounter}`
       : (requestedSessionId ?? `ephemeral_${Date.now()}_${++ephemeralCounter}`);
+    // Prefer omp's own tokenizer (captured on session start/end/compaction)
+    // over the local character heuristic. A per-turn ACP delta is never a
+    // context size, so it must not become the anchor.
+    const estimatedContextTokens = pool.getOmpContextTokens(sessionKey) ?? heuristicContextTokens;
 
     // Sync current tools to MCP bridge only when tools are present
     if (hasTools) {

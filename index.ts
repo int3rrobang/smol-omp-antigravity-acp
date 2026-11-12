@@ -141,18 +141,46 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
     pool.clearPersistedSession(sessionId);
   };
 
+  // ACP's billing counters are per-turn deltas, so the context bar needs omp's
+  // own tokenizer count. Capture it at the boundaries where the retained
+  // context changes; the stream adapter prefers this over its local heuristic.
+  const contextUsageTokens = (ctx: unknown): number | undefined => {
+    if (!ctx || typeof ctx !== "object" || !("getContextUsage" in ctx)) return undefined;
+    const getContextUsage = ctx.getContextUsage;
+    if (typeof getContextUsage !== "function") return undefined;
+    const usage: unknown = getContextUsage.call(ctx);
+    if (!usage || typeof usage !== "object" || !("tokens" in usage)) return undefined;
+    const tokens = usage.tokens;
+    return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : undefined;
+  };
+
+  const captureContextUsage = (ctx: unknown): void => {
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    if (!sessionId) return;
+    if (mainSessionId && sessionId !== mainSessionId) return;
+    pool.setOmpContextTokens(sessionId, contextUsageTokens(ctx));
+  };
+
   // Pre-warm the ACP process + MCP bridge when an interactive session starts,
   // so the first turn doesn't pay cold boot cost without spawning `agy acp`
   // from one-shot CLI commands such as `omp usage`. Also restore the handle of
   // a conversation agy may still be holding from an earlier process.
   pi.on?.("session_start", (_event, ctx) => {
     restoreResumeCandidate(ctx);
+    captureContextUsage(ctx);
     pool.ensureConnection().catch(() => {});
   });
   pi.on?.("session_branch", dropResumeCandidate);
-  pi.on?.("session_tree", dropResumeCandidate);
+  pi.on?.("session_tree", (event, ctx) => {
+    dropResumeCandidate(event, ctx);
+    captureContextUsage(ctx);
+  });
   pi.on?.("session_compact", (_event, ctx) => {
     invalidateSession(ctx);
+    captureContextUsage(ctx);
+  });
+  pi.on?.("agent_end", (_event, ctx) => {
+    captureContextUsage(ctx);
   });
   // Automatic shake/snapcompact/full summaries emit this pair; the end event
   // is the only signal for shake, which does not append a compaction entry.
@@ -161,6 +189,7 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
     if ("aborted" in event && event.aborted === true) return;
     if ("skipped" in event && event.skipped === true) return;
     invalidateSession(ctx);
+    captureContextUsage(ctx);
   });
   // Best-effort manual `/shake` coverage. Programmatic shakes (body-read
   // timeout, dead-end rescue) are caught by the adapter's rewrite fingerprint.
