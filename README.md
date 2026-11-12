@@ -27,6 +27,8 @@ A smol, [`omp`](https://github.com/can1357/oh-my-pi)-native extension that overr
 - **OMP-native tool execution**: Suspends tool calls so OMP retains full control over permissions, TUI rendering, subagents, and hooks.
 - **Cache continuity**: Reuses warm ACP sessions and sends incremental message deltas to minimize cache misses, ensuring your quota doesn't get wrecked.
 - **Native session resume**: The live ACP handle is stored as a `custom` entry inside the omp session, so `--continue`/`--resume` after a restart reattaches with `session/resume` instead of replaying the transcript. Server-side history (thinking included) is preserved and the prefix cache stays warm.
+- **Compaction-safe sessions**: omp's local summaries (soft/short/turn-prefix) run in isolated ACP lanes instead of the live conversation; post-compaction history, including snapcompact image archives, is replayed in order; `shake`/prune rewrites force a rebuild; and stale resume handles are dropped after compaction.
+- **Quota failures are errors**: agy's `Individual quota reached` banner and ACP `refusal`/`cancelled` stop reasons now fail the turn, so omp can rotate credentials or fall back instead of reporting a successful empty task.
 - **Steering support**: Handles mid-turn user steering (text & images) and graceful cancellation drains on the active session.
 - **Dynamic model discovery**: Discovers account-accessible models and wires OMP's thinking effort toggle to ACP's.
 - **Quota-aware `/usage`**: Reports Antigravity's Gemini, Claude/GPT, and Gemini Argon quota windows in OMP's native `/usage` and `omp usage` via `agy -p "/usage"`. Disable it with `OMP_AGY_USAGE_SOURCE=off`.

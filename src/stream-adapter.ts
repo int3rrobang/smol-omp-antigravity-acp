@@ -43,7 +43,9 @@ export function computeMessagesHash(messages: Message[]): string {
         for (const b of msg.content) {
           hash.update(b.type || "");
           if (b.type === "text" && b.text) hash.update(b.text);
-          if (b.type === "image" && b.data) hash.update(b.data.slice(0, 100));
+          // Full bytes: PNG/JPEG base64 prefixes are shared headers, so a
+          // truncated slice cannot distinguish snapcompact frames or edits.
+          if (b.type === "image" && b.data) hash.update(b.data);
         }
       }
     } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
@@ -63,6 +65,64 @@ export function computeMessagesHash(messages: Message[]): string {
     }
   }
   return hash.digest("hex");
+}
+
+/**
+ * omp isolates one-shot provider calls under `:side:` / `:spec:` keys. Those
+ * must never be treated as the live conversation, even when they carry tools
+ * (handoff, `/btw`, speculative compaction).
+ */
+export function hasSideSessionSuffix(sessionId: string): boolean {
+  return /:(?:side|spec)(?::|$)/i.test(sessionId);
+}
+
+function countShakenMarkers(text: string): number {
+  let count = 0;
+  let index = text.indexOf("[shaken ");
+  while (index !== -1) {
+    count++;
+    index = text.indexOf("[shaken ", index + 8);
+  }
+  return count;
+}
+
+/**
+ * Structural fingerprint for history rewrites whose content the continuation
+ * hash deliberately ignores: `shake` replaces tool/assistant text in place and
+ * removes thinking blocks, while omp's duplicate-output notice changes tool
+ * result bodies without meaning to invalidate the live session.
+ *
+ * Counting shake markers and thinking-block presence catches `shake elide`
+ * and `shake thinking` without hashing the bodies that the cache path
+ * intentionally skips. Image changes are already covered by
+ * {@link computeMessagesHash}.
+ */
+export function computeRewriteFingerprint(messages: Message[]): string {
+  let shaken = 0;
+  let thinkingBlocks = 0;
+  let images = 0;
+
+  for (const msg of messages) {
+    const content = msg.content;
+    if (typeof content === "string") {
+      shaken += countShakenMarkers(content);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block.type === "text" && typeof block.text === "string") {
+        shaken += countShakenMarkers(block.text);
+      } else if (block.type === "thinking") {
+        // Count only: omp may normalize thinking text without intending a
+        // rewrite, but `shake thinking` removes the blocks entirely.
+        thinkingBlocks++;
+      } else if (block.type === "image") {
+        images++;
+      }
+    }
+  }
+
+  return `${shaken}:${thinkingBlocks}:${images}`;
 }
 
 function formatToolResultContent(content: string | (TextContent | ImageContent)[]): McpToolResultContent[] {
@@ -120,36 +180,98 @@ function formatTrailingSteeringBlocks(trailingMessages: Message[]): McpToolResul
   return result;
 }
 
+function contentToBlocks(content: unknown): any[] {
+  if (typeof content === "string") {
+    return content ? [{ type: "text", text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    return [{ type: "text", text: JSON.stringify(content) }];
+  }
+  const blocks: any[] = [];
+  for (const item of content) {
+    if (item.type === "text") {
+      if (item.text) blocks.push({ type: "text", text: item.text });
+    } else if (item.type === "image") {
+      blocks.push({ type: "image", data: item.data, mimeType: item.mimeType });
+    }
+  }
+  return blocks;
+}
+
+interface ToolCallLike {
+  type: string;
+  name?: string;
+  arguments?: unknown;
+}
+
+function asToolCallLike(block: unknown): ToolCallLike | undefined {
+  if (!block || typeof block !== "object" || !("type" in block)) return undefined;
+  const type = block.type;
+  return type === "toolCall" || type === "tool_use" ? (block as ToolCallLike) : undefined;
+}
+
+/** Flush a label into ordered text/image blocks without dropping images. */
+function labeledContentBlocks(label: string, content: unknown): any[] {
+  const blocks: any[] = [];
+  let text = label;
+  const flush = () => {
+    if (text) {
+      blocks.push({ type: "text", text });
+      text = "";
+    }
+  };
+
+  if (typeof content === "string") {
+    text += `\n${content}`;
+    flush();
+    return blocks;
+  }
+  if (!Array.isArray(content)) {
+    text += `\n${JSON.stringify(content)}`;
+    flush();
+    return blocks;
+  }
+  for (const item of content) {
+    if (item.type === "text") {
+      text += `\n${item.text}`;
+    } else if (item.type === "image") {
+      flush();
+      blocks.push({ type: "image", data: item.data, mimeType: item.mimeType });
+    }
+  }
+  flush();
+  return blocks;
+}
+
+/** agy concatenates adjacent text blocks without separators; merge them. */
+function mergeAdjacentTextBlocks(blocks: any[]): any[] {
+  const merged: any[] = [];
+  for (const block of blocks) {
+    const prev = merged[merged.length - 1];
+    if (block.type === "text" && prev?.type === "text") {
+      prev.text = `${prev.text}\n\n${block.text}`;
+    } else {
+      merged.push(block);
+    }
+  }
+  return merged;
+}
+
 function messagesToContentBlocks(messages: Message[]): any[] {
   const blocks: any[] = [];
   for (const msg of messages) {
     if (msg.role === "user") {
-      if (typeof msg.content === "string") {
-        blocks.push({ type: "text", text: msg.content });
-      } else if (Array.isArray(msg.content)) {
-        for (const item of msg.content) {
-          if (item.type === "text") {
-            blocks.push({ type: "text", text: item.text });
-          } else if (item.type === "image") {
-            blocks.push({ type: "image", data: item.data, mimeType: item.mimeType });
-          }
-        }
-      }
+      blocks.push(...contentToBlocks(msg.content));
     } else if (msg.role === "developer" || msg.role === "system") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map((c) => (c.type === "text" ? c.text : "")).join("\n")
-            : JSON.stringify(msg.content);
-      blocks.push({ type: "text", text: `[System Reminder]:\n${text}` });
+      blocks.push(...labeledContentBlocks("[System Reminder]:", msg.content));
     } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      // Format intervening assistant turns (e.g. when switching to another provider and back to Antigravity)
+      // Thinking is internal: omit it rather than replaying it as model-visible text.
       const parts = msg.content
         .map((c) => {
           if (c.type === "text") return c.text;
-          if (c.type === "toolCall" || (c as any).type === "tool_use") {
-            return `[Assistant Tool Call: ${c.name}(${JSON.stringify((c as any).arguments ?? {})})]`;
+          const toolCall = asToolCallLike(c);
+          if (toolCall) {
+            return `[Assistant Tool Call: ${toolCall.name}(${JSON.stringify(toolCall.arguments ?? {})})]`;
           }
           return "";
         })
@@ -159,30 +281,15 @@ function messagesToContentBlocks(messages: Message[]): any[] {
         blocks.push({ type: "text", text: `[Previous Assistant Turn]:\n${parts}` });
       }
     } else if (msg.role === "toolResult" || msg.role === "tool") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("\n")
-            : JSON.stringify(msg.content);
-      blocks.push({ type: "text", text: `[Tool Result for ${(msg as any).toolCallId}]:\n${text}` });
+      const toolCallId = "toolCallId" in msg && typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+      blocks.push(...labeledContentBlocks(`[Tool Result for ${toolCallId}]:`, msg.content));
     }
   }
 
-  // Merge adjacent text blocks with "\n\n" because agy.exe concatenates multiple text blocks without separators
-  const merged: any[] = [];
-  for (const blk of blocks) {
-    const prev = merged[merged.length - 1];
-    if (blk.type === "text" && prev?.type === "text") {
-      prev.text = `${prev.text}\n\n${blk.text}`;
-    } else {
-      merged.push(blk);
-    }
-  }
-  return merged;
+  return mergeAdjacentTextBlocks(blocks);
 }
 
-function formatFullHistoryTranscript(messages: Message[]): any[] {
+export function formatFullHistoryTranscript(messages: Message[]): any[] {
   if (messages.length === 0) {
     return [{ type: "text", text: "Hello" }];
   }
@@ -200,50 +307,71 @@ function formatFullHistoryTranscript(messages: Message[]): any[] {
     return messagesToContentBlocks(messages);
   }
 
-  // Compile history transcript from 0 to lastUserIdx - 1
+  const blocks: any[] = [];
   let transcript = "The following is a transcript of previous turns in this conversation:\n\n";
+
+  const flush = () => {
+    if (transcript) {
+      blocks.push({ type: "text", text: transcript });
+      transcript = "";
+    }
+  };
+  const addText = (text: string) => {
+    transcript += text;
+  };
+  const addImage = (image: ImageContent) => {
+    flush();
+    blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+  };
+  const addContent = (prefix: string, content: unknown) => {
+    addText(prefix);
+    if (typeof content === "string") {
+      addText(`${content}\n\n`);
+      return;
+    }
+    if (!Array.isArray(content)) {
+      addText(`${JSON.stringify(content)}\n\n`);
+      return;
+    }
+    for (const item of content) {
+      if (item.type === "text") {
+        addText(item.text);
+      } else if (item.type === "image") {
+        addImage(item);
+      }
+    }
+    addText("\n\n");
+  };
+
   for (let i = 0; i < lastUserIdx; i++) {
     const msg = messages[i];
     if (msg.role === "user") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : msg.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("\n");
-      transcript += `User: ${text}\n\n`;
+      addContent("User: ", msg.content);
     } else if (msg.role === "assistant") {
+      // Thinking is internal: replaying it as text would promote discarded
+      // reasoning and defeat `shake thinking`.
       const text = msg.content
         .map((c) => {
           if (c.type === "text") return c.text;
-          if (c.type === "thinking") return `[Thinking: ${c.thinking}]`;
-          if (c.type === "toolCall" || (c as any).type === "tool_use") return `[Tool Call: ${c.name}]`;
+          const toolCall = asToolCallLike(c);
+          if (toolCall) return `[Tool Call: ${toolCall.name}]`;
           return "";
         })
+        .filter(Boolean)
         .join("\n");
-      transcript += `Assistant: ${text}\n\n`;
+      addText(`Assistant: ${text}\n\n`);
     } else if (msg.role === "toolResult" || msg.role === "tool") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("\n")
-            : JSON.stringify(msg.content);
-      transcript += `[Tool Result for ${(msg as any).toolCallId}]:\n${text}\n\n`;
+      const toolCallId = "toolCallId" in msg && typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+      addContent(`[Tool Result for ${toolCallId}]:\n`, msg.content);
     } else if (msg.role === "developer" || msg.role === "system") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map((c) => (c.type === "text" ? c.text : "")).join("\n")
-            : JSON.stringify(msg.content);
-      transcript += `[System Instruction]:\n${text}\n\n`;
+      addContent("[System Instruction]:\n", msg.content);
     }
   }
-  transcript += "---\nContinue the conversation responding to the user below.\n\n";
+  addText("---\nContinue the conversation responding to the user below.\n\n");
+  flush();
 
-  const resultBlocks: any[] = [{ type: "text", text: transcript }];
-  const latestBlocks = messagesToContentBlocks(messages.slice(lastUserIdx));
-  resultBlocks.push(...latestBlocks);
-  return resultBlocks;
+  blocks.push(...messagesToContentBlocks(messages.slice(lastUserIdx)));
+  return mergeAdjacentTextBlocks(blocks);
 }
 
 // ============================================================================
@@ -325,6 +453,16 @@ function applyUsage(
 
 let ephemeralCounter = 0;
 
+/**
+ * agy surfaces a backend quota 429 as a normal assistant chunk instead of an
+ * ACP error. The banner is the only reliable signal: "Individual quota
+ * reached ... upgrade your subscription ... Resets in N". Match both halves so
+ * a legitimate answer that merely discusses quota does not trip it.
+ */
+const QUOTA_BANNER_RE =
+  /individual\s+quota\s+reached[\s\S]{0,240}(?:upgrade\s+your\s+subscription|resets?\s+in\s+\d)/i;
+const QUOTA_PROBE_LIMIT = 256;
+
 export function streamAntigravityAcp(
   pool: AcpSessionPool,
   model: Model<any>,
@@ -349,19 +487,12 @@ export function streamAntigravityAcp(
     // Emit start event immediately
     stream.push({ type: "start", partial });
 
-    const isEphemeral = !options?.sessionId;
-    const sessionKey = options?.sessionId || `ephemeral_${Date.now()}_${++ephemeralCounter}`;
     const hasTools = Boolean(context.tools && context.tools.length > 0);
     const cwd = options?.cwd || process.cwd();
     const requestedEffort =
       options?.disableReasoning || options?.forceReasoningOff
         ? "low"
         : (options?.reasoning ?? options?.effort);
-
-    // Sync current tools to MCP bridge only when tools are present
-    if (hasTools) {
-      pool.mcpBridge.setSessionTools(sessionKey, context.tools ?? []);
-    }
 
     // Tool routing instruction appended to system prompt only when tools are enabled
     const toolRoutingInstruction =
@@ -383,7 +514,51 @@ export function streamAntigravityAcp(
         : rawSystemPrompt,
     );
 
+    const requestedSessionId = options?.sessionId;
+    const existingSession = requestedSessionId ? pool.getSession(requestedSessionId) : undefined;
+    const systemPromptHash = createHash("sha256").update(systemPromptAppend).digest("hex");
+
+    // omp's one-shot calls reuse the live sessionId for cache routing. A bare
+    // summarizer/utility Context has no `tools` and a different system prompt
+    // from the live conversation, so it must never enter the live lane. Side
+    // keys (`:side:`/`:spec:`) are one-shot by construction, even with tools.
+    const isSideRequest =
+      (requestedSessionId ? hasSideSessionSuffix(requestedSessionId) : false) ||
+      (context.tools === undefined &&
+        existingSession !== undefined &&
+        systemPromptHash !== existingSession.systemPromptHash);
+    const isEphemeral = isSideRequest || !requestedSessionId;
+    const sessionKey = isSideRequest
+      ? `side:${requestedSessionId ?? "anon"}:${++ephemeralCounter}`
+      : (requestedSessionId ?? `ephemeral_${Date.now()}_${++ephemeralCounter}`);
+
+    // Sync current tools to MCP bridge only when tools are present
+    if (hasTools) {
+      pool.mcpBridge.setSessionTools(sessionKey, context.tools ?? []);
+    }
+
     let session = pool.getSession(sessionKey);
+
+    // A compaction/shake/prune notice may have arrived between turns. Never
+    // resume a rewritten conversation from its pre-rewrite prefix.
+    if (session?.stale) {
+      await pool.resetSession(sessionKey);
+      session = undefined;
+    }
+
+    // Backstop for rewrites whose event was detached or never emitted (mid-turn
+    // shake, body-read timeout, rescue elide). The continuation hash ignores
+    // tool/assistant bodies by design; this fingerprint does not.
+    if (session && session.rewriteFingerprint && session.syncedMessageCount > 0) {
+      const prefixCount = session.syncedMessageCount - 1;
+      if (
+        context.messages.length >= prefixCount &&
+        computeRewriteFingerprint(context.messages.slice(0, prefixCount)) !== session.rewriteFingerprint
+      ) {
+        await pool.resetSession(sessionKey);
+        session = undefined;
+      }
+    }
 
     // Track active content block state for stream events
     let currentBlockType: "none" | "thinking" | "text" = "none";
@@ -411,6 +586,48 @@ export function streamAntigravityAcp(
       }
     };
 
+    const emitTextDelta = (text: string) => {
+      if (!text) return;
+      if (currentBlockType !== "text") {
+        closeCurrentBlock();
+        partial.content.push({ type: "text", text: "" });
+        currentBlockIndex = partial.content.length - 1;
+        currentBlockType = "text";
+        stream.push({
+          type: "text_start",
+          contentIndex: currentBlockIndex,
+          partial,
+        });
+      }
+      const blk = partial.content[currentBlockIndex] as TextContent;
+      blk.text += text;
+      stream.push({
+        type: "text_delta",
+        contentIndex: currentBlockIndex,
+        delta: text,
+        partial,
+      });
+    };
+
+    // agy's quota banner must fail the turn before any text is emitted:
+    // omp only rotates credentials/falls back while the turn is replay-safe.
+    let quotaProbe: string | null = "";
+    const flushQuotaProbe = () => {
+      if (quotaProbe === null) return;
+      const buffered = quotaProbe;
+      quotaProbe = null;
+      emitTextDelta(buffered);
+    };
+    const failQuotaTurn = (activeSession: LiveAcpSession, banner: string) => {
+      quotaProbe = null;
+      closeCurrentBlock();
+      activeSession.eventListener = null;
+      pool.unbindAbortSignal(activeSession);
+      pool.clearPersistedSession(sessionKey);
+      pool.resetSession(sessionKey).catch(() => {});
+      stream.fail(new Error(banner.trim() || "Antigravity quota reached"));
+    };
+
     const attachEventListener = (activeSession: LiveAcpSession, activePromptPromise: Promise<any>) => {
       const turnListener = (ev: AcpUpdateEvent) => {
         if (stream.done || activeSession.eventListener !== turnListener) return;
@@ -436,28 +653,33 @@ export function streamAntigravityAcp(
             partial,
           });
         } else if (ev.type === "text_delta") {
-          if (currentBlockType !== "text") {
-            closeCurrentBlock();
-            partial.content.push({ type: "text", text: "" });
-            currentBlockIndex = partial.content.length - 1;
-            currentBlockType = "text";
-            stream.push({
-              type: "text_start",
-              contentIndex: currentBlockIndex,
-              partial,
-            });
+          if (quotaProbe !== null) {
+            quotaProbe += ev.text;
+            if (QUOTA_BANNER_RE.test(quotaProbe)) {
+              failQuotaTurn(activeSession, quotaProbe);
+              return;
+            }
+            // Hold only the opening window; normal streaming resumes as soon
+            // as it is clear this is not the banner.
+            if (quotaProbe.length < QUOTA_PROBE_LIMIT && !quotaProbe.includes("\n")) {
+              return;
+            }
+            const buffered = quotaProbe;
+            quotaProbe = null;
+            emitTextDelta(buffered);
+          } else {
+            // Late backstop: a banner split across chunks after the opening
+            // window still fails the turn, though it may no longer be retryable.
+            if (QUOTA_BANNER_RE.test(ev.text)) {
+              failQuotaTurn(activeSession, ev.text);
+              return;
+            }
+            emitTextDelta(ev.text);
           }
-          const blk = partial.content[currentBlockIndex] as TextContent;
-          blk.text += ev.text;
-          stream.push({
-            type: "text_delta",
-            contentIndex: currentBlockIndex,
-            delta: ev.text,
-            partial,
-          });
         } else if (ev.type === "usage") {
           applyUsage(partial, ev, model);
         } else if (ev.type === "mcp_tool_calls_ready") {
+          flushQuotaProbe();
           closeCurrentBlock();
 
           activeSession.pendingMcpBatch = {
@@ -496,6 +718,7 @@ export function streamAntigravityAcp(
           partial.stopReason = "toolUse";
           activeSession.syncedMessageCount = context.messages.length + 1;
           activeSession.prefixHash = computeMessagesHash(context.messages);
+          activeSession.rewriteFingerprint = computeRewriteFingerprint(context.messages);
           pool.recordSessionState(sessionKey);
           // Unbind abort signal while oh-my-pi executes the tool locally so a user
           // steer/interrupt during tool execution aborts only the local tool, keeping
@@ -509,14 +732,66 @@ export function streamAntigravityAcp(
           });
           stream.end();
         } else if (ev.type === "prompt_done") {
+          // Check the still-buffered opening before emitting it: a short banner
+          // must fail without making the turn replay-unsafe.
+          if (quotaProbe !== null && QUOTA_BANNER_RE.test(quotaProbe)) {
+            failQuotaTurn(activeSession, quotaProbe);
+            return;
+          }
+          flushQuotaProbe();
           closeCurrentBlock();
           // Authoritative totals for the turn — the interim usage_update stream
           // is sparse, so most turns only ever get their numbers here.
           applyUsage(partial, ev.usage, model);
 
-          partial.stopReason = "stop";
+          const fullText = partial.content
+            .filter((c): c is TextContent => c.type === "text")
+            .map((c) => c.text)
+            .join("");
+          if (QUOTA_BANNER_RE.test(fullText)) {
+            failQuotaTurn(activeSession, fullText);
+            return;
+          }
+
+          const acpStopReason = ev.stopReason;
+          if (acpStopReason === "refusal" || acpStopReason === "error") {
+            activeSession.eventListener = null;
+            pool.unbindAbortSignal(activeSession);
+            pool.clearPersistedSession(sessionKey);
+            pool.resetSession(sessionKey).catch(() => {});
+            const refusalText = fullText.trim();
+            stream.fail(
+              new Error(
+                refusalText
+                  ? `Antigravity refused to continue the turn: ${refusalText}`
+                  : "Antigravity refused to continue the turn",
+              ),
+            );
+            return;
+          }
+          if (acpStopReason === "cancelled") {
+            activeSession.eventListener = null;
+            pool.unbindAbortSignal(activeSession);
+            partial.stopReason = "aborted";
+            stream.push({
+              type: "done",
+              reason: "aborted",
+              message: structuredClone(partial),
+            });
+            stream.end();
+            if (isEphemeral) {
+              pool.resetSession(sessionKey).catch(() => {});
+            }
+            return;
+          }
+
+          partial.stopReason =
+            acpStopReason === "max_tokens" || acpStopReason === "max_turn_requests"
+              ? "length"
+              : "stop";
           activeSession.syncedMessageCount = context.messages.length + 1;
           activeSession.prefixHash = computeMessagesHash(context.messages);
+          activeSession.rewriteFingerprint = computeRewriteFingerprint(context.messages);
           pool.recordSessionState(sessionKey);
           pool.unbindAbortSignal(activeSession);
 
@@ -530,6 +805,7 @@ export function streamAntigravityAcp(
             pool.resetSession(sessionKey).catch(() => {});
           }
         } else if (ev.type === "prompt_error") {
+          flushQuotaProbe();
           closeCurrentBlock();
           pool.unbindAbortSignal(activeSession);
           stream.fail(ev.error);
@@ -577,67 +853,82 @@ export function streamAntigravityAcp(
 
     // Case 1: Resuming a Suspended MCP Tool Call Turn
     if (session && session.pendingMcpBatch && session.pendingMcpBatch.calls.size > 0) {
-      const delta = context.messages.slice(session.syncedMessageCount);
-      const toolResults = delta.filter(
-        (m): m is ToolResultMessage => m.role === "tool" || (m as any).role === "toolResult",
-      );
-      const trailingMessages = delta.filter(
-        (m) => m.role === "user" || m.role === "developer" || m.role === "system",
-      );
+      const prefixCount = session.syncedMessageCount - 1;
+      const prefixIntact =
+        session.syncedMessageCount > 0 &&
+        context.messages.length > prefixCount &&
+        context.messages[prefixCount]?.role === "assistant" &&
+        computeMessagesHash(context.messages.slice(0, prefixCount)) === session.prefixHash;
 
-      const heldCalls = session.pendingMcpBatch.calls;
-      const allCallsMatched = Array.from(heldCalls.values()).every((call) =>
-        toolResults.some(
-          (tr) =>
-            tr.toolCallId === call.callId ||
-            (tr as any).id === call.callId ||
-            (toolResults.length === 1 && heldCalls.size === 1),
-        ),
-      );
-
-      if (allCallsMatched) {
-        const activePromptPromise = session.pendingMcpBatch.promptPromise!;
-        session.pendingMcpBatch = null;
-
-        // Checkpoint the messages sent up through this resumed tool turn immediately
-        // so an abort/steer-flush mid-generation still preserves prefix continuity.
-        session.syncedMessageCount = context.messages.length + 1;
-        session.prefixHash = computeMessagesHash(context.messages);
-        pool.recordSessionState(sessionKey);
-
-        // Attach listener & abort signal for this resumed step
-        attachEventListener(session, activePromptPromise);
-        pool.bindAbortSignal(session, options?.signal);
-
-        // Resolve each held tool call with its corresponding result
-        const callList = Array.from(heldCalls.values());
-        for (let i = 0; i < callList.length; i++) {
-          const call = callList[i];
-          const matchedResult =
-            toolResults.find(
-              (tr) =>
-                tr.toolCallId === call.callId ||
-                (tr as any).id === call.callId,
-            ) || toolResults[i];
-
-          const contentBlocks = formatToolResultContent(matchedResult?.content ?? "");
-
-          // If there are trailing user/developer steering messages, format their text & images cleanly
-          if (i === callList.length - 1 && trailingMessages.length > 0) {
-            contentBlocks.push(...formatTrailingSteeringBlocks(trailingMessages));
-          }
-
-          call.resolve({
-            content: contentBlocks,
-            isError: matchedResult?.isError,
-          });
-        }
-
-        return;
-      } else {
-        // Mismatch: abort batch and recreate
+      if (!prefixIntact) {
+        // The transcript was rewritten under the suspended turn (compaction,
+        // shake, prune). Results belong to the old prefix; resolve nothing and
+        // rebuild on a fresh ACP conversation.
         pool.abortPendingMcpBatch(session);
         session = undefined;
+      } else {
+        const delta = context.messages.slice(session.syncedMessageCount);
+        const toolResults = delta.filter(
+          (m): m is ToolResultMessage => m.role === "tool" || (m as any).role === "toolResult",
+        );
+        const trailingMessages = delta.filter(
+          (m) => m.role === "user" || m.role === "developer" || m.role === "system",
+        );
+
+        const heldCalls = session.pendingMcpBatch.calls;
+        // Match only by toolCallId. The old positional/idless fallback could
+        // resolve a held call from an unrelated turn after a history rewrite.
+        const matchedResults = new Map<string, ToolResultMessage>();
+        const allCallsMatched = Array.from(heldCalls.values()).every((call) => {
+          const matched = toolResults.find((tr) => {
+            const legacyId = "id" in tr && typeof tr.id === "string" ? tr.id : undefined;
+            return tr.toolCallId === call.callId || legacyId === call.callId;
+          });
+          if (!matched) return false;
+          matchedResults.set(call.callId, matched);
+          return true;
+        });
+
+        if (allCallsMatched) {
+          const activePromptPromise = session.pendingMcpBatch.promptPromise!;
+          session.pendingMcpBatch = null;
+
+          // Checkpoint the messages sent up through this resumed tool turn immediately
+          // so an abort/steer-flush mid-generation still preserves prefix continuity.
+          session.syncedMessageCount = context.messages.length + 1;
+          session.prefixHash = computeMessagesHash(context.messages);
+          session.rewriteFingerprint = computeRewriteFingerprint(context.messages);
+          pool.recordSessionState(sessionKey);
+
+          // Attach listener & abort signal for this resumed step
+          attachEventListener(session, activePromptPromise);
+          pool.bindAbortSignal(session, options?.signal);
+
+          // Resolve each held tool call with its corresponding result
+          const callList = Array.from(heldCalls.values());
+          for (let i = 0; i < callList.length; i++) {
+            const call = callList[i];
+            const matchedResult = matchedResults.get(call.callId)!;
+
+            const contentBlocks = formatToolResultContent(matchedResult.content ?? "");
+
+            // If there are trailing user/developer steering messages, format their text & images cleanly
+            if (i === callList.length - 1 && trailingMessages.length > 0) {
+              contentBlocks.push(...formatTrailingSteeringBlocks(trailingMessages));
+            }
+
+            call.resolve({
+              content: contentBlocks,
+              isError: matchedResult.isError,
+            });
+          }
+
+          return;
+        } else {
+          // Mismatch: abort batch and recreate
+          pool.abortPendingMcpBatch(session);
+          session = undefined;
+        }
       }
     }
 
@@ -675,6 +966,7 @@ export function streamAntigravityAcp(
         // Checkpoint prefix before dispatching so an abort mid-stream preserves continuity
         session.syncedMessageCount = context.messages.length + 1;
         session.prefixHash = computeMessagesHash(context.messages);
+        session.rewriteFingerprint = computeRewriteFingerprint(context.messages);
         pool.recordSessionState(sessionKey);
 
         const promptPromise = pool.sendPrompt(session, promptBlocks, options?.signal);
@@ -686,6 +978,9 @@ export function streamAntigravityAcp(
 
     // Case 3: New Session or History Rewrite / Compaction
     if (session) {
+      // The old ACP conversation no longer matches omp's history. Drop its
+      // durable handle before rebuilding so a restart cannot reattach it.
+      pool.clearPersistedSession(sessionKey);
       await pool.resetSession(sessionKey);
     }
 
@@ -702,6 +997,7 @@ export function streamAntigravityAcp(
     // Checkpoint prefix before dispatching so an abort on Turn 1 still preserves continuity for Turn 2
     session.syncedMessageCount = context.messages.length + 1;
     session.prefixHash = computeMessagesHash(context.messages);
+    session.rewriteFingerprint = computeRewriteFingerprint(context.messages);
     pool.recordSessionState(sessionKey);
 
     const promptBlocks = formatFullHistoryTranscript(context.messages);

@@ -101,6 +101,12 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
 
     let latest: PersistedAcpSessionState | null = null;
     for (const entry of manager?.getBranch?.() ?? []) {
+      // A compaction or branch summary rewrites the context; any handle saved
+      // before it belongs to a conversation omp no longer has.
+      if (entry?.type === "compaction" || entry?.type === "branch_summary") {
+        latest = null;
+        continue;
+      }
       if (entry?.type !== "custom" || entry.customType !== SESSION_STATE_ENTRY) continue;
       const data = entry.data as
         | { sessionKey?: string; state?: PersistedAcpSessionState | null }
@@ -115,8 +121,22 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // original continuation — reattaching it on the new branch would splice in
   // turns the branch does not have, so drop the handle instead.
   const dropResumeCandidate = (_event: unknown, ctx: unknown): void => {
-    const sessionId = mainSessionId ?? sessionManagerOf(ctx)?.getSessionId?.();
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
     if (!sessionId) return;
+    if (mainSessionId && sessionId !== mainSessionId) return;
+    pool.markStale(sessionId);
+    pool.setResumeCandidate(sessionId, null);
+    pool.clearPersistedSession(sessionId);
+  };
+
+  // omp rewrites history behind the plugin's back for compaction, shake,
+  // pruning, and image drops. Mark the live ACP conversation stale so the next
+  // provider request rebuilds it instead of appending to a pre-rewrite prefix.
+  const invalidateSession = (ctx: unknown): void => {
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    if (!sessionId) return;
+    if (mainSessionId && sessionId !== mainSessionId) return;
+    pool.markStale(sessionId);
     pool.setResumeCandidate(sessionId, null);
     pool.clearPersistedSession(sessionId);
   };
@@ -131,6 +151,30 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   });
   pi.on?.("session_branch", dropResumeCandidate);
   pi.on?.("session_tree", dropResumeCandidate);
+  pi.on?.("session_compact", (_event, ctx) => {
+    invalidateSession(ctx);
+  });
+  // Automatic shake/snapcompact/full summaries emit this pair; the end event
+  // is the only signal for shake, which does not append a compaction entry.
+  pi.on?.("auto_compaction_end", (event, ctx) => {
+    if (!event || typeof event !== "object") return;
+    if ("aborted" in event && event.aborted === true) return;
+    if ("skipped" in event && event.skipped === true) return;
+    invalidateSession(ctx);
+  });
+  // Best-effort manual `/shake` coverage. Programmatic shakes (body-read
+  // timeout, dead-end rescue) are caught by the adapter's rewrite fingerprint.
+  pi.on?.("input", (event, ctx) => {
+    if (
+      event &&
+      typeof event === "object" &&
+      "text" in event &&
+      typeof event.text === "string" &&
+      /^\s*\/shake(?:\s|$)/.test(event.text)
+    ) {
+      invalidateSession(ctx);
+    }
+  });
 
   // Register the provider
   pi.registerProvider(ANTIGRAVITY_PROVIDER_NAME, {

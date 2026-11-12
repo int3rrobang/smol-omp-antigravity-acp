@@ -464,6 +464,18 @@ export interface LiveAcpSession {
   systemPromptHash: string;
   syncedMessageCount: number;
   prefixHash: string;
+  /**
+   * Set when omp has rewritten the history behind this conversation (compaction,
+   * shake, prune, image drop). The next provider request must rebuild instead of
+   * trusting the append-only prefix.
+   */
+  stale: boolean;
+  /**
+   * Structural fingerprint of the checkpointed prefix (shake markers, thinking
+   * shape, image count). Cheap backstop for rewrites whose event was detached
+   * or never emitted.
+   */
+  rewriteFingerprint: string;
   inFlightPrompt: Promise<any> | null;
   unbindAbort: (() => void) | null;
   pendingMcpBatch: {
@@ -487,6 +499,8 @@ export interface PersistedAcpSessionState {
   systemPromptHash: string;
   syncedMessageCount: number;
   prefixHash: string;
+  /** See {@link LiveAcpSession.rewriteFingerprint}; omitted for older entries. */
+  rewriteFingerprint?: string;
 }
 
 export class AcpSessionPool {
@@ -569,6 +583,12 @@ export class AcpSessionPool {
     return this.sessions.get(sessionKey);
   }
 
+  /** Mark a live conversation as rewritten so the next request rebuilds it. */
+  public markStale(sessionKey: string): void {
+    const session = this.sessions.get(sessionKey);
+    if (session) session.stale = true;
+  }
+
   /** Offer a previously persisted handle; `null` means "nothing to reattach to". */
   public setResumeCandidate(sessionKey: string, state: PersistedAcpSessionState | null): void {
     if (state) this.resumeCandidates.set(sessionKey, state);
@@ -585,7 +605,9 @@ export class AcpSessionPool {
 
   /** A conversation is resumable once at least one turn has been checkpointed. */
   private snapshotSession(session: LiveAcpSession): PersistedAcpSessionState | null {
-    if (!session.prefixHash) return null;
+    // A stale handle points at a conversation omp has already rewritten; never
+    // carry it across a restart.
+    if (session.stale || !session.prefixHash) return null;
     return {
       acpSessionId: session.acpSessionId,
       cwd: session.cwd,
@@ -594,6 +616,7 @@ export class AcpSessionPool {
       systemPromptHash: session.systemPromptHash,
       syncedMessageCount: session.syncedMessageCount,
       prefixHash: session.prefixHash,
+      rewriteFingerprint: session.rewriteFingerprint,
     };
   }
 
@@ -770,6 +793,8 @@ export class AcpSessionPool {
       systemPromptHash,
       syncedMessageCount: resumed && resume ? resume.syncedMessageCount : 0,
       prefixHash: resumed && resume ? resume.prefixHash : "",
+      stale: false,
+      rewriteFingerprint: resumed && resume?.rewriteFingerprint ? resume.rewriteFingerprint : "",
       inFlightPrompt: null,
       unbindAbort: null,
       pendingMcpBatch: null,
