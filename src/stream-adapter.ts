@@ -412,6 +412,60 @@ interface AcpUsageSnapshot {
   cachedReadTokens?: number;
   cachedWriteTokens?: number;
   thoughtTokens?: number;
+  /** ACP's current context occupancy (`used`). */
+  contextTokens?: number;
+  /** ACP's context window (`size`), used to normalize `contextTokens`. */
+  contextWindow?: number;
+}
+
+/**
+ * ACP's per-turn usage counters are deltas, not the size of omp's context.
+ * Anchor on omp's actual context instead: OMP includes the system prompt,
+ * retained history and tool schemas in its context bar, so estimate the same
+ * surface. Images are budgeted as a flat cost; their base64 is not text.
+ */
+function estimateContextTokens(context: Context): number {
+  let chars = 0;
+  let images = 0;
+
+  const countContent = (content: unknown): void => {
+    if (typeof content === "string") {
+      chars += content.length;
+      return;
+    }
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const type = "type" in block ? block.type : undefined;
+      if (type === "text" && "text" in block && typeof block.text === "string") {
+        chars += block.text.length;
+      } else if (type === "thinking" && "thinking" in block && typeof block.thinking === "string") {
+        chars += block.thinking.length;
+      } else if (type === "image") {
+        images += 1;
+      } else if (type === "toolCall" || type === "tool_use") {
+        if ("name" in block && typeof block.name === "string") chars += block.name.length;
+        if ("arguments" in block) chars += JSON.stringify(block.arguments ?? {}).length;
+      } else if ("content" in block) {
+        countContent(block.content);
+      }
+    }
+  };
+
+  for (const message of context.messages) {
+    countContent(message.content);
+    if ("toolName" in message && typeof message.toolName === "string") chars += message.toolName.length;
+    if ("toolCallId" in message && typeof message.toolCallId === "string") chars += message.toolCallId.length;
+  }
+  const systemPrompt = Array.isArray(context.systemPrompt)
+    ? context.systemPrompt.join("\n\n")
+    : (context.systemPrompt ?? "");
+  chars += systemPrompt.length;
+  for (const tool of context.tools ?? []) {
+    chars += tool.name.length + (tool.description?.length ?? 0);
+    if (tool.parameters) chars += JSON.stringify(tool.parameters).length;
+  }
+  return Math.ceil(chars / 4) + images * 1_000;
 }
 
 /**
@@ -425,6 +479,7 @@ function applyUsage(
   partial: AssistantMessage,
   usage: AcpUsageSnapshot | undefined,
   model: Model<any>,
+  estimatedContextTokens?: number,
 ): void {
   if (!usage) return;
 
@@ -437,6 +492,25 @@ function applyUsage(
   // already counts thoughts inside `outputTokens`, so this is display only.
   u.totalTokens = u.input + u.output + u.cacheRead + u.cacheWrite;
   if (usage.thoughtTokens) u.reasoningTokens = usage.thoughtTokens;
+  // The ACP counters are per-turn deltas; the context bar needs the server's
+  // absolute occupancy. Normalize it to omp's model window so a 1M-vs-1.048M
+  // size difference (or a resumed branch) cannot make the gauge jump.
+  if (usage.contextTokens !== undefined && Number.isFinite(usage.contextTokens)) {
+    const used = Math.max(0, usage.contextTokens);
+    const size = usage.contextWindow;
+    u.contextTokens =
+      size !== undefined && Number.isFinite(size) && size > 0 && model.contextWindow > 0
+        ? Math.round((used / size) * model.contextWindow)
+        : used;
+  } else if (
+    u.contextTokens === undefined &&
+    estimatedContextTokens !== undefined &&
+    estimatedContextTokens > 0
+  ) {
+    // CLI ACP often reports only per-turn deltas. Anchor on omp's context
+    // estimate so the bar does not fall from a replayed prompt to the delta.
+    u.contextTokens = estimatedContextTokens;
+  }
 
   if (!model.cost) return;
   u.cost = {
@@ -475,6 +549,7 @@ export function streamAntigravityAcp(
 
   // Run the async turn logic in background IIFE
   (async () => {
+    const estimatedContextTokens = estimateContextTokens(context);
     const partial: AssistantMessage = {
       role: "assistant",
       content: [],
@@ -679,7 +754,7 @@ export function streamAntigravityAcp(
             emitTextDelta(ev.text);
           }
         } else if (ev.type === "usage") {
-          applyUsage(partial, ev, model);
+          applyUsage(partial, ev, model, estimatedContextTokens);
         } else if (ev.type === "mcp_tool_calls_ready") {
           flushQuotaProbe();
           closeCurrentBlock();
@@ -744,7 +819,7 @@ export function streamAntigravityAcp(
           closeCurrentBlock();
           // Authoritative totals for the turn — the interim usage_update stream
           // is sparse, so most turns only ever get their numbers here.
-          applyUsage(partial, ev.usage, model);
+          applyUsage(partial, ev.usage, model, estimatedContextTokens);
 
           const fullText = partial.content
             .filter((c): c is TextContent => c.type === "text")

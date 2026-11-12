@@ -1168,6 +1168,8 @@ export class AcpSessionPool {
         cachedReadTokens: update.cachedTokens ?? update.cacheReadTokens,
         cachedWriteTokens: update.cachedWriteTokens,
         thoughtTokens: update.thoughtsTokens ?? update.thoughtTokens,
+        contextTokens: update.used,
+        contextWindow: update.size,
       });
     }
   }

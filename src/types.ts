@@ -55,6 +55,12 @@ export interface Usage {
   cacheRead: number;
   cacheWrite: number;
   totalTokens: number;
+  /**
+   * Server-reported context occupancy, normalized to the OMP model's window.
+   * OMP prefers this over input + cacheRead + cacheWrite when anchoring the
+   * context bar; without it, per-turn deltas look like the whole context.
+   */
+  contextTokens?: number;
   /** Thinking tokens, reported separately from `output` for display. */
   reasoningTokens?: number;
   cost: ModelCost;
@@ -542,7 +548,16 @@ export interface HeldMcpToolCall {
 export type AcpUpdateEvent =
   | { type: "thinking_delta"; text: string }
   | { type: "text_delta"; text: string }
-  | { type: "usage"; inputTokens: number; outputTokens: number; cachedReadTokens?: number; cachedWriteTokens?: number; thoughtTokens?: number }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      cachedReadTokens?: number;
+      cachedWriteTokens?: number;
+      thoughtTokens?: number;
+      contextTokens?: number;
+      contextWindow?: number;
+    }
   | { type: "mcp_tool_calls_ready"; calls: HeldMcpToolCall[] }
   | { type: "prompt_done"; stopReason: string; usage?: any }
   | { type: "prompt_error"; error: Error };
