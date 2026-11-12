@@ -384,17 +384,18 @@ export class McpBridgeServer {
       const callId = `agy_call_${Date.now()}_${++callCounter}`;
 
       let settled = false;
-      const sendResult = (resultPayload: any) => {
+      const sendResult = (resultPayload: Record<string, unknown>) => {
         if (settled) return;
         settled = true;
+        // The socket may already be closed (ACP process exited, session reset).
+        // A per-call `close` listener here leaks one listener per tool call and
+        // triggers Node's MaxListenersExceededWarning on long-lived bridges;
+        // `destroyed` gives the same guard without accumulating listeners.
+        if (socket.destroyed) return;
         try {
           socket.write(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, ...resultPayload }) + "\n");
         } catch {}
       };
-
-      socket.on("close", () => {
-        settled = true;
-      });
 
       const heldCall: HeldMcpToolCall = {
         callId,
