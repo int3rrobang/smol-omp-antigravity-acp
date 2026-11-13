@@ -196,6 +196,24 @@ OMP_AGY_USAGE_SOURCE=off
 
 ---
 
+## Limitations
+
+The plugin keeps a live conversation inside `agy` and sends only new turns. This is an inherent limitation of the stateful ACP protocol.
+As such, anything invisible to the `omp` host is not portable:
+
+- **Compaction and rewinds start over.** Any history rewrite — compaction,
+  rewind, branch switch, prune, image drop — invalidates the live conversation.
+  The next turn replays omp's transcript, so the server-side reasoning tokens
+  are lost and the rebuilt prefix is a cache miss. As of now, rewinding to a pre-compact leaf
+  does not restore the old `agy` conversation.
+- **Resume is best-effort.** A saved conversation survives an omp restart only
+  while `agy` still has it. If `agy` restarted, upgraded, or cleaned it up, the
+  plugin cold-rebuilds.
+- **The `agy` side is opaque and version-coupled.** ACP has no fork, merge, or
+  truncate, and no access to its hidden reasoning. Permissions and MCP
+  handshakes depend on the installed `agy`; an update can break tool calls until
+  the plugin catches up.
+
 ## Credits
 
 - **[`t3code`](https://github.com/pingdotgg/t3code)** ([PR #1204](https://github.com/pingdotgg/t3code/pull/1204)) for developing the `agy acp` JSON-RPC stdio client & MCP bridge pattern.
