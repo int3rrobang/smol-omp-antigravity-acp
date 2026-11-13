@@ -600,6 +600,16 @@ export function antigravityModelPricing(
   baseId: string,
   now: number = Date.now(),
 ): Pick<ProviderModelConfig, "cost" | "contextWindow" | "maxTokens"> | undefined {
+  if (baseId === "gemini-4-hydrogen") {
+    // Standard tier list price: $1.50 input / $7.50 output / $0.075 cached
+    // per 1M tokens (Batch/Flex are half). Source:
+    // https://ai.google.dev/gemini-api/docs/pricing, checked 2026-11-13.
+    return {
+      cost: { input: 1.5, output: 7.5, cacheRead: 0.075, cacheWrite: 0 },
+      contextWindow: 1048576,
+      maxTokens: 65536,
+    };
+  }
   if (baseId === "gemini-4-carbon") {
     const atListPrice = now >= Date.parse("2026-12-01T08:00:00Z");
     return {
