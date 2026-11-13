@@ -55,6 +55,12 @@ export interface Usage {
   cacheRead: number;
   cacheWrite: number;
   totalTokens: number;
+  /**
+   * Server-reported context occupancy, normalized to the OMP model's window.
+   * OMP prefers this over input + cacheRead + cacheWrite when anchoring the
+   * context bar; without it, per-turn deltas look like the whole context.
+   */
+  contextTokens?: number;
   /** Thinking tokens, reported separately from `output` for display. */
   reasoningTokens?: number;
   cost: ModelCost;
@@ -542,7 +548,16 @@ export interface HeldMcpToolCall {
 export type AcpUpdateEvent =
   | { type: "thinking_delta"; text: string }
   | { type: "text_delta"; text: string }
-  | { type: "usage"; inputTokens: number; outputTokens: number; cachedReadTokens?: number; cachedWriteTokens?: number; thoughtTokens?: number }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      cachedReadTokens?: number;
+      cachedWriteTokens?: number;
+      thoughtTokens?: number;
+      contextTokens?: number;
+      contextWindow?: number;
+    }
   | { type: "mcp_tool_calls_ready"; calls: HeldMcpToolCall[] }
   | { type: "prompt_done"; stopReason: string; usage?: any }
   | { type: "prompt_error"; error: Error };
@@ -585,6 +600,16 @@ export function antigravityModelPricing(
   baseId: string,
   now: number = Date.now(),
 ): Pick<ProviderModelConfig, "cost" | "contextWindow" | "maxTokens"> | undefined {
+  if (baseId === "gemini-4-hydrogen") {
+    // Standard tier list price: $1.50 input / $7.50 output / $0.075 cached
+    // per 1M tokens (Batch/Flex are half). Source:
+    // https://ai.google.dev/gemini-api/docs/pricing, checked 2026-11-13.
+    return {
+      cost: { input: 1.5, output: 7.5, cacheRead: 0.075, cacheWrite: 0 },
+      contextWindow: 1048576,
+      maxTokens: 65536,
+    };
+  }
   if (baseId === "gemini-4-carbon") {
     const atListPrice = now >= Date.parse("2026-12-01T08:00:00Z");
     return {

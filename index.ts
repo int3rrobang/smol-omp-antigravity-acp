@@ -101,6 +101,12 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
 
     let latest: PersistedAcpSessionState | null = null;
     for (const entry of manager?.getBranch?.() ?? []) {
+      // A compaction or branch summary rewrites the context; any handle saved
+      // before it belongs to a conversation omp no longer has.
+      if (entry?.type === "compaction" || entry?.type === "branch_summary") {
+        latest = null;
+        continue;
+      }
       if (entry?.type !== "custom" || entry.customType !== SESSION_STATE_ENTRY) continue;
       const data = entry.data as
         | { sessionKey?: string; state?: PersistedAcpSessionState | null }
@@ -115,10 +121,44 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // original continuation — reattaching it on the new branch would splice in
   // turns the branch does not have, so drop the handle instead.
   const dropResumeCandidate = (_event: unknown, ctx: unknown): void => {
-    const sessionId = mainSessionId ?? sessionManagerOf(ctx)?.getSessionId?.();
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
     if (!sessionId) return;
+    if (mainSessionId && sessionId !== mainSessionId) return;
+    pool.markStale(sessionId);
     pool.setResumeCandidate(sessionId, null);
     pool.clearPersistedSession(sessionId);
+  };
+
+  // omp rewrites history behind the plugin's back for compaction, shake,
+  // pruning, and image drops. Mark the live ACP conversation stale so the next
+  // provider request rebuilds it instead of appending to a pre-rewrite prefix.
+  const invalidateSession = (ctx: unknown): void => {
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    if (!sessionId) return;
+    if (mainSessionId && sessionId !== mainSessionId) return;
+    pool.markStale(sessionId);
+    pool.setResumeCandidate(sessionId, null);
+    pool.clearPersistedSession(sessionId);
+  };
+
+  // ACP's billing counters are per-turn deltas, so the context bar needs omp's
+  // own tokenizer count. Capture it at the boundaries where the retained
+  // context changes; the stream adapter prefers this over its local heuristic.
+  const contextUsageTokens = (ctx: unknown): number | undefined => {
+    if (!ctx || typeof ctx !== "object" || !("getContextUsage" in ctx)) return undefined;
+    const getContextUsage = ctx.getContextUsage;
+    if (typeof getContextUsage !== "function") return undefined;
+    const usage: unknown = getContextUsage.call(ctx);
+    if (!usage || typeof usage !== "object" || !("tokens" in usage)) return undefined;
+    const tokens = usage.tokens;
+    return typeof tokens === "number" && Number.isFinite(tokens) ? tokens : undefined;
+  };
+
+  const captureContextUsage = (ctx: unknown): void => {
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    if (!sessionId) return;
+    if (mainSessionId && sessionId !== mainSessionId) return;
+    pool.setOmpContextTokens(sessionId, contextUsageTokens(ctx));
   };
 
   // Pre-warm the ACP process + MCP bridge when an interactive session starts,
@@ -127,10 +167,43 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // a conversation agy may still be holding from an earlier process.
   pi.on?.("session_start", (_event, ctx) => {
     restoreResumeCandidate(ctx);
+    captureContextUsage(ctx);
     pool.ensureConnection().catch(() => {});
   });
   pi.on?.("session_branch", dropResumeCandidate);
-  pi.on?.("session_tree", dropResumeCandidate);
+  pi.on?.("session_tree", (event, ctx) => {
+    dropResumeCandidate(event, ctx);
+    captureContextUsage(ctx);
+  });
+  pi.on?.("session_compact", (_event, ctx) => {
+    invalidateSession(ctx);
+    captureContextUsage(ctx);
+  });
+  pi.on?.("agent_end", (_event, ctx) => {
+    captureContextUsage(ctx);
+  });
+  // Automatic shake/snapcompact/full summaries emit this pair; the end event
+  // is the only signal for shake, which does not append a compaction entry.
+  pi.on?.("auto_compaction_end", (event, ctx) => {
+    if (!event || typeof event !== "object") return;
+    if ("aborted" in event && event.aborted === true) return;
+    if ("skipped" in event && event.skipped === true) return;
+    invalidateSession(ctx);
+    captureContextUsage(ctx);
+  });
+  // Best-effort manual `/shake` coverage. Programmatic shakes (body-read
+  // timeout, dead-end rescue) are caught by the adapter's rewrite fingerprint.
+  pi.on?.("input", (event, ctx) => {
+    if (
+      event &&
+      typeof event === "object" &&
+      "text" in event &&
+      typeof event.text === "string" &&
+      /^\s*\/shake(?:\s|$)/.test(event.text)
+    ) {
+      invalidateSession(ctx);
+    }
+  });
 
   // Register the provider
   pi.registerProvider(ANTIGRAVITY_PROVIDER_NAME, {
