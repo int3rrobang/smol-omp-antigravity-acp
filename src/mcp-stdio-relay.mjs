@@ -123,13 +123,28 @@ async function handleLine(line) {
   }
 
   if (rpc.method === "server/discover") {
+    // MCP 2026-07-28 discovery probe. agy 1.5.8 sends this before the legacy
+    // `initialize` handshake; a -32601 makes its client mark the server
+    // unusable and fail every MCP tool call after the permission gate. Advertise
+    // the legacy revision this relay actually speaks so the client falls back.
     process.stdout.write(
       JSON.stringify({
         jsonrpc: "2.0",
         id: rpc.id,
-        error: {
-          code: -32601,
-          message: "Method not found: server/discover",
+        result: {
+          resultType: "complete",
+          supportedVersions: ["2024-11-05"],
+          capabilities: {
+            tools: {
+              listChanged: true,
+            },
+          },
+          _meta: {
+            "io.modelcontextprotocol/serverInfo": {
+              name: "omp-tools",
+              version: "0.1.0",
+            },
+          },
         },
       }) + "\n",
     );

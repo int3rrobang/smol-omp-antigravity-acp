@@ -371,7 +371,11 @@ export class AcpConnection {
 
   private handleServerRequest(msg: { id: number | string; method: string; params?: any }): void {
     if (msg.method === "session/request_permission") {
-      const toolCall = msg.params?.toolCall;
+      // ACP v1 puts the tool call at the top level; the v2 shape wraps it in
+      // `subject`. Accept both so the MCP-vs-builtin split keeps working.
+      const toolCall =
+        msg.params?.toolCall ??
+        (msg.params?.subject?.type === "tool_call" ? msg.params.subject.toolCall : undefined);
       const options = Array.isArray(msg.params?.options) ? msg.params.options : [];
 
       // Check if tool is from our MCP bridge (has _meta.is_mcp_tool_call or omp prefix)
@@ -390,9 +394,11 @@ export class AcpConnection {
           options[0];
 
         if (allowOpt) {
-          this.sendResponse(msg.id, { outcome: "selected", optionId: allowOpt.optionId });
+          this.sendResponse(msg.id, {
+            outcome: { outcome: "selected", optionId: allowOpt.optionId },
+          });
         } else {
-          this.sendResponse(msg.id, { outcome: "cancelled" });
+          this.sendResponse(msg.id, { outcome: { outcome: "cancelled" } });
         }
       } else {
         // Reject built-in tools (run_command, write_file, etc.) so agy does not mutate files behind omp's back!
@@ -401,9 +407,11 @@ export class AcpConnection {
           options.find((o: any) => o.kind === "reject_always");
 
         if (rejectOpt) {
-          this.sendResponse(msg.id, { outcome: "selected", optionId: rejectOpt.optionId });
+          this.sendResponse(msg.id, {
+            outcome: { outcome: "selected", optionId: rejectOpt.optionId },
+          });
         } else {
-          this.sendResponse(msg.id, { outcome: "cancelled" });
+          this.sendResponse(msg.id, { outcome: { outcome: "cancelled" } });
         }
       }
       return;
