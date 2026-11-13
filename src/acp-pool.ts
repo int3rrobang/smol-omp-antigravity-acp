@@ -484,6 +484,12 @@ export interface LiveAcpSession {
    * or never emitted.
    */
   rewriteFingerprint: string;
+  /**
+   * True when this live session was reattached to a persisted handle. Its
+   * checkpoint hash was computed by an earlier process; omp may have
+   * normalized the reloaded transcript without actually rewriting it.
+   */
+  restored: boolean;
   inFlightPrompt: Promise<any> | null;
   unbindAbort: (() => void) | null;
   pendingMcpBatch: {
@@ -615,6 +621,14 @@ export class AcpSessionPool {
   public setResumeCandidate(sessionKey: string, state: PersistedAcpSessionState | null): void {
     if (state) this.resumeCandidates.set(sessionKey, state);
     else this.resumeCandidates.delete(sessionKey);
+  }
+
+  public hasResumeCandidate(sessionKey: string, cwd?: string, systemPromptHash?: string): boolean {
+    const candidate = this.resumeCandidates.get(sessionKey);
+    if (!candidate) return false;
+    if (cwd && candidate.cwd !== cwd) return false;
+    if (systemPromptHash && candidate.systemPromptHash !== systemPromptHash) return false;
+    return true;
   }
 
   /** Snapshot the checkpoint so a later process can resume from it. */
@@ -817,6 +831,7 @@ export class AcpSessionPool {
       prefixHash: resumed && resume ? resume.prefixHash : "",
       stale: false,
       rewriteFingerprint: resumed && resume?.rewriteFingerprint ? resume.rewriteFingerprint : "",
+      restored: Boolean(resumed && resume),
       inFlightPrompt: null,
       unbindAbort: null,
       pendingMcpBatch: null,

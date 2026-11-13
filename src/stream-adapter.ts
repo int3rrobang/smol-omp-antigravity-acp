@@ -49,11 +49,16 @@ export function computeMessagesHash(messages: Message[]): string {
         }
       }
     } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      // Hash structural identity (toolCall IDs/names) without hashing thinking/text that omp may normalize
+      // Hash structural identity (tool call names/order) without hashing
+      // thinking/text that omp may normalize, and without tool-call IDs:
+      // the plugin sends `[Assistant Tool Call: name(args)]` to agy, not the
+      // ID, so an ID regenerated across a resume must not look like a rewrite.
       for (const b of msg.content) {
-        if (b.type === "toolCall" || (b as any).type === "tool_use") {
-          hash.update(`tc:${b.id || ""}:${b.name || ""}`);
-        }
+        if (typeof b !== "object" || b === null || !("type" in b)) continue;
+        const type = b.type;
+        if (typeof type !== "string" || (type !== "toolCall" && type !== "tool_use")) continue;
+        const name = "name" in b && typeof b.name === "string" ? b.name : "";
+        hash.update(`tc:${name}`);
       }
     } else if (msg.role === "toolResult" || msg.role === "tool") {
       // Hash only toolCallId, NOT toolResult body text!
@@ -372,8 +377,13 @@ export function formatFullHistoryTranscript(messages: Message[]): any[] {
   addText("--- END OF EARLIER MESSAGES ---\nThe user's current request follows. Answer it directly.\n\n");
   flush();
 
-  blocks.push(...messagesToContentBlocks(messages.slice(lastUserIdx)));
-  return mergeAdjacentTextBlocks(blocks);
+  // Keep the current request in its own block. agy may concatenate adjacent
+  // text blocks, but a separate block prevents the request from being merged
+  // into the historical transcript and ignored after a full replay.
+  return [
+    ...mergeAdjacentTextBlocks(blocks),
+    ...messagesToContentBlocks(messages.slice(lastUserIdx)),
+  ];
 }
 
 // ============================================================================
@@ -619,6 +629,21 @@ export function streamAntigravityAcp(
     }
 
     let session = pool.getSession(sessionKey);
+    // A resume candidate lives in the pool, not in the live-session map. On
+    // the first turn after an omp restart, materialize it before the delta
+    // checks; otherwise the adapter always falls through to Case 3 and cold
+    // replays the whole transcript.
+    if (!session && pool.hasResumeCandidate(sessionKey, cwd, systemPromptHash)) {
+      session = await pool.createSession(
+        sessionKey,
+        cwd,
+        systemPromptAppend,
+        model.id,
+        requestedEffort,
+        options?.apiKey,
+        hasTools,
+      );
+    }
 
     // A compaction/shake/prune notice may have arrived between turns. Never
     // resume a rewritten conversation from its pre-rewrite prefix.
@@ -1023,13 +1048,26 @@ export function streamAntigravityAcp(
       const prefixCount = session.syncedMessageCount - 1;
       const expectedPrefixHash = session.prefixHash;
       const actualPrefixHash = computeMessagesHash(context.messages.slice(0, prefixCount));
+      const prefixHashMatches = actualPrefixHash === expectedPrefixHash;
+      // A restored handle's hash was computed by the process that saved it.
+      // omp can normalize the reloaded transcript (tool-call ids, blob/image
+      // representation) without changing it semantically; a mismatch is not
+      // proof of a rewrite. The structural fingerprint above already cleared
+      // shake/prune, and compaction/branch changes drop the handle, so keep the
+      // warm conversation and append the delta instead of cold-replaying.
+      const restoredAppend = session.restored && !prefixHashMatches;
       const hasAssistantAtBorder = context.messages[prefixCount]?.role === "assistant";
       // When a turn is aborted before emitting text, oh-my-pi drops the empty assistant message
       // and places the next user/steer message directly at `prefixCount`.
       const hasAbortedTurnContinuation =
         !hasAssistantAtBorder && context.messages.length > prefixCount;
 
-      if (actualPrefixHash === expectedPrefixHash && (hasAssistantAtBorder || hasAbortedTurnContinuation)) {
+      if ((prefixHashMatches || restoredAppend) && (hasAssistantAtBorder || hasAbortedTurnContinuation)) {
+        if (restoredAppend) {
+          pool.onWarning?.(
+            "ACP resume checkpoint hash differed after reload; appending the delta instead of replaying history.",
+          );
+        }
         const deltaStart = hasAssistantAtBorder ? session.syncedMessageCount : prefixCount;
         const deltaMessages = context.messages.slice(deltaStart);
         const promptBlocks = messagesToContentBlocks(deltaMessages);
@@ -1048,6 +1086,7 @@ export function streamAntigravityAcp(
         session.syncedMessageCount = context.messages.length + 1;
         session.prefixHash = computeMessagesHash(context.messages);
         session.rewriteFingerprint = computeRewriteFingerprint(context.messages);
+        session.restored = false;
         pool.recordSessionState(sessionKey);
 
         const promptPromise = pool.sendPrompt(session, promptBlocks, options?.signal);
@@ -1058,22 +1097,25 @@ export function streamAntigravityAcp(
     }
 
     // Case 3: New Session or History Rewrite / Compaction
-    if (session) {
+    if (session && session.syncedMessageCount > 0) {
       // The old ACP conversation no longer matches omp's history. Drop its
       // durable handle before rebuilding so a restart cannot reattach it.
       pool.clearPersistedSession(sessionKey);
       await pool.resetSession(sessionKey);
+      session = undefined;
     }
 
-    session = await pool.createSession(
-      sessionKey,
-      cwd,
-      systemPromptAppend,
-      model.id,
-      requestedEffort,
-      options?.apiKey,
-      hasTools,
-    );
+    if (!session) {
+      session = await pool.createSession(
+        sessionKey,
+        cwd,
+        systemPromptAppend,
+        model.id,
+        requestedEffort,
+        options?.apiKey,
+        hasTools,
+      );
+    }
 
     // Checkpoint prefix before dispatching so an abort on Turn 1 still preserves continuity for Turn 2
     session.syncedMessageCount = context.messages.length + 1;
