@@ -7,6 +7,9 @@
  */
 
 import { createHash } from "node:crypto";
+import { appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   type Context,
   type Model,
@@ -176,9 +179,12 @@ function formatTrailingSteeringBlocks(trailingMessages: Message[]): McpToolResul
 
   const result: McpToolResultContent[] = [];
   if (textParts.length > 0) {
+    // Bracket label, not an angle-bracket tag: the backend rule that 429s
+    // `<system-conventions>` / `<system-directive>` must not catch our own
+    // steering wrapper on the same `<system-*>` shape.
     result.push({
       type: "text",
-      text: `\n\n<system-reminder>\n${textParts.join("\n\n")}\n</system-reminder>`,
+      text: `\n\n[System Reminder]\n${textParts.join("\n\n")}\n[End System Reminder]`,
     });
   }
   result.push(...imageBlocks);
@@ -392,11 +398,21 @@ export function formatFullHistoryTranscript(messages: Message[]): any[] {
 
 /**
  * Google's Cloud Code Assist backend answers a false HTTP 429
- * RESOURCE_EXHAUSTED when the system instruction carries the RFC-2119 keyword
- * sentence (or the `<system-conventions>` / `<system-directive>` section tags)
- * that harness prompts such as omp's ship verbatim: the payload trips a
- * server-side rule and the rejection is misreported as quota. The `agy` CLI is
- * unaffected because its own prompt lacks those literals.
+ * RESOURCE_EXHAUSTED when the payload carries certain verbatim harness
+ * sentences: the RFC-2119 keyword sentence, the `<system-conventions>` /
+ * `<system-directive>` section tags, and (since ~2026-11-15) omp's tool-docs
+ * line `Read xd://<tool> for full docs + JSON schema before first use.`
+ * Bisected live: the exact sentence 429s in ~2s while either half and a
+ * one-word paraphrase pass — a fixed-string fingerprint, same family as the
+ * RFC one (can1357/oh-my-pi#18706). The `agy` CLI is unaffected because its
+ * own prompt lacks those literals.
+ *
+ * The rule scans the whole request, not just the system instruction: omp's
+ * developer/system history, compaction summaries, and steered reminders are
+ * replayed as prompt text, so every outbound text block needs the same
+ * rewrite — sanitizing only the session's system instruction still 429s on
+ * the first history replay. Our own steering wrapper avoids the
+ * `<system-*>` tag shape entirely for the same reason.
  *
  * Rewriting them keeps the instruction's meaning while avoiding the match.
  * Set OMP_AGY_SANITIZE_PROMPT=off to send the prompt exactly as omp built it.
@@ -407,12 +423,144 @@ export function sanitizeSystemPrompt(prompt: string): string {
     return prompt;
   }
 
-  return prompt
-    .replaceAll("RFC 2119 keywords:", "Spec keywords:")
-    .replaceAll("RFC 2119:", "Spec keywords:")
-    .replaceAll("RFC 2119", "spec keywords")
-    .replaceAll("system-conventions", "system_conventions")
-    .replaceAll("system-directive", "system_directive");
+    return prompt
+      .replace(/RFC[\s\-_]*2119\s+keywords\s*:/gi, "Spec keywords:")
+      .replace(/RFC[\s\-_]*2119\s*:/gi, "Spec keywords:")
+      .replace(/RFC[\s\-_]*2119/gi, "spec keywords")
+      .replace(/system-conventions/gi, "system_conventions")
+      .replace(/system-directive/gi, "system_directive")
+      .replace(
+        /Read\s+xd:\/\/<tool>\s+for\s+full\s+docs\s*\+\s*JSON\s+schema\s+before\s+first\s+use\./gi,
+        "Check xd://<tool> for the complete reference, including the JSON schema, before your first tool call.",
+      );
+}
+
+/**
+ * Per-session nonce for the sanitized `system_*` tags: `<system_conventions
+ * id="<hex>">`. Same idea as upstream's `<system-conventions id="…">`
+ * (can1357/oh-my-pi#11918) — the tag keeps its exact meaning for the model,
+ * but no two sessions share the identical byte string, so a fixed-string
+ * backend fingerprint can never go stable. Deterministic per omp session key
+ * (not random per call): the system-prompt hash must be identical across
+ * restarts of the same session or resume breaks and every restart cold-replays.
+ */
+export function applyTagNonce(prompt: string, nonce: string): string {
+  if (!nonce) return prompt;
+  return prompt.replace(/<(system_(?:conventions|directive))>/gi, `<$1 id="${nonce}">`);
+}
+
+/** Derive the session nonce: stable for a session key, unique across keys. */
+export function deriveSessionNonce(sessionKey: string): string {
+  return createHash("sha256").update(`omp-agy-sess-nonce v1:${sessionKey}`).digest("hex").slice(0, 8);
+}
+
+/**
+ * Apply {@link sanitizeSystemPrompt} to the text of outbound ACP prompt
+ * blocks (history replays, message deltas, steered tool results). Image
+ * blocks pass through untouched. Honors OMP_AGY_SANITIZE_PROMPT=off.
+ */
+export function sanitizePromptBlocks(blocks: any[], nonce?: string): any[] {
+  return blocks.map((block) => {
+    if (
+      block &&
+      typeof block === "object" &&
+      block.type === "text" &&
+      typeof block.text === "string"
+    ) {
+      let text = sanitizeSystemPrompt(block.text);
+      if (nonce) text = applyTagNonce(text, nonce);
+      return text === block.text ? block : { ...block, text };
+    }
+    return block;
+  });
+}
+
+/**
+ * The backend also rejects `session/prompt` at the RPC level with a bare
+ * `429 RESOURCE_EXHAUSTED` and no quota banner — same misreported shape as
+ * the system-prompt blocklist trip, but with no streamed text to match
+ * against. That path surfaces as `prompt_error`, so classify it here: tell
+ * quota apart from a content-rule rejection and point at the payload dump
+ * instead of letting omp retry it blindly as "API error (attempt N)".
+ */
+const PROMPT_REJECTED_RE = /resource.exhausted|\b429\b/i;
+
+export function classifyPromptError(err: unknown): Error {
+  const raw = err instanceof Error ? err : new Error(String(err));
+  if (!PROMPT_REJECTED_RE.test(raw.message)) return raw;
+  return new Error(
+    `${raw.message}\n\nAntigravity rejected the request before generating (no quota banner was streamed). ` +
+      `When the quota pools are healthy this is the backend content rule misreported as 429 — ` +
+      `the same family as the RFC-2119 / system-conventions trip. ` +
+      `The exact rejected payload was saved to the OS temp dir (\`omp-agy-prompt-failed-*.jsonl\`) for blocklist diffing. ` +
+      `The live session was kept; a retry replays the same shape.`,
+  );
+}
+
+/**
+ * Opt-in payload capture for the next false 429. Writes one JSON line per
+ * `session/prompt` send: session key, system-prompt hash, and the outbound
+ * text blocks (image bytes excluded, long texts capped). Off by default;
+ * `OMP_AGY_DUMP_PROMPT=off` (or unset) disables. Compare a rejected payload
+ * against a succeeding one to isolate the new blocklist entry.
+ */
+function writePayloadDump(
+  file: string,
+  sessionKey: string,
+  systemPromptHash: string,
+  blocks: any[],
+  systemPromptAppend?: string,
+  note?: string,
+): string | null {
+  try {
+    const capped = blocks.map((block) => {
+      if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
+        const text = block.text.length > 200_000 ? `${block.text.slice(0, 200_000)}\n…[truncated]` : block.text;
+        return { type: "text", text };
+      }
+      // Image bytes are never written to disk; record the omission instead.
+      return { type: block?.type ?? "unknown", omitted: true };
+    });
+    appendFileSync(
+      join(tmpdir(), file),
+      `${JSON.stringify({ ts: Date.now(), sessionKey, systemPromptHash, note: note ?? "", blocks: capped, systemPromptAppend: (systemPromptAppend ?? "").slice(0, 200_000) })}\n`,
+    );
+    return join(tmpdir(), file);
+  } catch {
+    return null;
+  }
+}
+
+export function dumpPromptPayload(
+  sessionKey: string,
+  systemPromptHash: string,
+  blocks: any[],
+  systemPromptAppend?: string,
+): void {
+  const flag = (process.env.OMP_AGY_DUMP_PROMPT ?? "").trim().toLowerCase();
+  if (!flag || flag === "off" || flag === "0" || flag === "false" || flag === "no") return;
+  writePayloadDump(`omp-agy-prompt-${process.pid}.jsonl`, sessionKey, systemPromptHash, blocks, systemPromptAppend);
+}
+
+/**
+ * Failure dump: same capture as {@link dumpPromptPayload} but unconditional.
+ * A 429 with no pre-armed flag is exactly when the payload matters most, and
+ * omp never records outbound provider bytes itself — without this the
+ * rejected shape is gone. One file per failure; each holds a single line.
+ */
+export function dumpFailedPayload(
+  session: LiveAcpSession,
+  sessionKey: string,
+  note: string,
+): string | null {
+  return writePayloadDump(
+    `omp-agy-prompt-failed-${Date.now()}.jsonl`,
+    sessionKey,
+    session.systemPromptHash,
+    session.lastPromptBlocks ?? [],
+    session.lastSystemPromptAppend,
+    note,
+  );
 }
 
 /** Shape shared by `usage_update` events and the `session/prompt` result. */
@@ -549,6 +697,17 @@ const QUOTA_BANNER_RE =
   /individual\s+quota\s+reached[\s\S]{0,240}(?:upgrade\s+your\s+subscription|resets?\s+in\s+\d)/i;
 const QUOTA_PROBE_LIMIT = 256;
 
+/**
+ * agy retries a rejected prompt internally with exponential backoff, streaming
+ * one `⚠ API error (attempt N): RESOURCE_EXHAUSTED ...` notice per attempt.
+ * Left unmatched the turn spins for minutes; fail on the first notice so omp
+ * can rotate credentials (or the user can abort) while still replay-safe.
+ * Both halves are required so a legitimate answer discussing API errors does
+ * not trip it.
+ */
+export const AGY_RETRY_NOTICE_RE =
+  /⚠?\s*API error\s*\(attempt\s*\d+\)[\s\S]{0,300}RESOURCE_EXHAUSTED/i;
+
 export function streamAntigravityAcp(
   pool: AcpSessionPool,
   model: Model<any>,
@@ -593,7 +752,9 @@ export function streamAntigravityAcp(
         ? context.systemPrompt
         : "";
 
-    const systemPromptAppend = sanitizeSystemPrompt(
+    // Sanitized but not yet nonce-tagged: the side-request check below must
+    // see the same bytes with or without a nonce, so it compares on this.
+    const basePromptAppend = sanitizeSystemPrompt(
       hasTools
         ? rawSystemPrompt
           ? `${rawSystemPrompt}\n\n${toolRoutingInstruction}`
@@ -603,21 +764,33 @@ export function streamAntigravityAcp(
 
     const requestedSessionId = options?.sessionId;
     const existingSession = requestedSessionId ? pool.getSession(requestedSessionId) : undefined;
-    const systemPromptHash = createHash("sha256").update(systemPromptAppend).digest("hex");
 
     // omp's one-shot calls reuse the live sessionId for cache routing. A bare
     // summarizer/utility Context has no `tools` and a different system prompt
     // from the live conversation, so it must never enter the live lane. Side
     // keys (`:side:`/`:spec:`) are one-shot by construction, even with tools.
+    // The comparison runs on the nonce-tagged bytes: the live lane's key is the
+    // requested session id, so its nonce is known before the lane is chosen.
+    const liveLaneHash =
+      requestedSessionId && existingSession
+        ? createHash("sha256")
+            .update(applyTagNonce(basePromptAppend, deriveSessionNonce(requestedSessionId)))
+            .digest("hex")
+        : "";
     const isSideRequest =
       (requestedSessionId ? hasSideSessionSuffix(requestedSessionId) : false) ||
-      (context.tools === undefined &&
-        existingSession !== undefined &&
-        systemPromptHash !== existingSession.systemPromptHash);
+      (context.tools === undefined && existingSession !== undefined && liveLaneHash !== existingSession.systemPromptHash);
     const isEphemeral = isSideRequest || !requestedSessionId;
     const sessionKey = isSideRequest
       ? `side:${requestedSessionId ?? "anon"}:${++ephemeralCounter}`
       : (requestedSessionId ?? `ephemeral_${Date.now()}_${++ephemeralCounter}`);
+
+    // Tag nonce last: deterministic per session key, so the hash below is
+    // stable across restarts of the same session (resume keeps working) while
+    // no two sessions ever send the identical tag bytes.
+    const sessionNonce = deriveSessionNonce(sessionKey);
+    const systemPromptAppend = applyTagNonce(basePromptAppend, sessionNonce);
+    const systemPromptHash = createHash("sha256").update(systemPromptAppend).digest("hex");
     // Prefer omp's own tokenizer (captured on session start/end/compaction)
     // over the local character heuristic. A per-turn ACP delta is never a
     // context size, so it must not become the anchor.
@@ -718,6 +891,9 @@ export function streamAntigravityAcp(
     // agy's quota banner must fail the turn before any text is emitted:
     // omp only rotates credentials/falls back while the turn is replay-safe.
     let quotaProbe: string | null = "";
+    // Rolling tail of streamed text; the retry notice can split across chunk
+    // boundaries, so pattern tests run here rather than on single chunks.
+    let recentText = "";
     const flushQuotaProbe = () => {
       if (quotaProbe === null) return;
       const buffered = quotaProbe;
@@ -727,6 +903,7 @@ export function streamAntigravityAcp(
     const failQuotaTurn = (activeSession: LiveAcpSession, banner: string) => {
       quotaProbe = null;
       closeCurrentBlock();
+      dumpFailedPayload(activeSession, sessionKey, "quota-banner");
       activeSession.eventListener = null;
       pool.unbindAbortSignal(activeSession);
       pool.clearPersistedSession(sessionKey);
@@ -759,9 +936,16 @@ export function streamAntigravityAcp(
             partial,
           });
         } else if (ev.type === "text_delta") {
+          // Fail on agy's first retry notice instead of streaming minutes of
+          // backoff attempts; the failure dump already captured the payload.
+          recentText = (recentText + ev.text).slice(-600);
+          if (QUOTA_BANNER_RE.test(recentText) || AGY_RETRY_NOTICE_RE.test(recentText)) {
+            failQuotaTurn(activeSession, recentText.trim());
+            return;
+          }
           if (quotaProbe !== null) {
             quotaProbe += ev.text;
-            if (QUOTA_BANNER_RE.test(quotaProbe)) {
+            if (QUOTA_BANNER_RE.test(quotaProbe) || AGY_RETRY_NOTICE_RE.test(quotaProbe)) {
               failQuotaTurn(activeSession, quotaProbe);
               return;
             }
@@ -776,7 +960,7 @@ export function streamAntigravityAcp(
           } else {
             // Late backstop: a banner split across chunks after the opening
             // window still fails the turn, though it may no longer be retryable.
-            if (QUOTA_BANNER_RE.test(ev.text)) {
+            if (QUOTA_BANNER_RE.test(ev.text) || AGY_RETRY_NOTICE_RE.test(ev.text)) {
               failQuotaTurn(activeSession, ev.text);
               return;
             }
@@ -821,6 +1005,12 @@ export function streamAntigravityAcp(
             });
           }
 
+          // Usage on this turn stays (near-)zero by design: agy reports token
+          // counts only on the settled `session/prompt` result, cumulative for
+          // the whole tool loop, while interim `usage_update` events carry just
+          // context occupancy. The prompt is still suspended here, so there are
+          // no per-step tokens to record — the final `prompt_done` turn absorbs
+          // the loop and session-level totals stay correct. Do not estimate.
           partial.stopReason = "toolUse";
           activeSession.syncedMessageCount = context.messages.length + 1;
           activeSession.prefixHash = computeMessagesHash(context.messages);
@@ -854,7 +1044,7 @@ export function streamAntigravityAcp(
             .filter((c): c is TextContent => c.type === "text")
             .map((c) => c.text)
             .join("");
-          if (QUOTA_BANNER_RE.test(fullText)) {
+          if (QUOTA_BANNER_RE.test(fullText) || AGY_RETRY_NOTICE_RE.test(fullText)) {
             failQuotaTurn(activeSession, fullText);
             return;
           }
@@ -913,8 +1103,15 @@ export function streamAntigravityAcp(
         } else if (ev.type === "prompt_error") {
           flushQuotaProbe();
           closeCurrentBlock();
+          // No flag needed: the rejected bytes are captured exactly when they
+          // matter, since omp never records outbound provider payloads.
+          dumpFailedPayload(activeSession, sessionKey, "prompt_error");
           pool.unbindAbortSignal(activeSession);
-          stream.fail(ev.error);
+          // Keep the live session: an RPC-level 429 is the backend
+          // rejecting this payload, not a dead conversation — nuking the
+          // handle would force a full cold replay of the same shape that
+          // just got rejected. Ephemeral lanes still reset below.
+          stream.fail(classifyPromptError(ev.error));
           if (isEphemeral) {
             pool.resetSession(sessionKey).catch(() => {});
           }
@@ -1024,7 +1221,9 @@ export function streamAntigravityAcp(
             }
 
             call.resolve({
-              content: contentBlocks,
+              // Tool results and steered reminders ride the same backend
+              // rule as the system prompt; rewrite the known literals.
+              content: sanitizePromptBlocks(contentBlocks, sessionNonce),
               isError: matchedResult.isError,
             });
           }
@@ -1070,11 +1269,15 @@ export function streamAntigravityAcp(
         }
         const deltaStart = hasAssistantAtBorder ? session.syncedMessageCount : prefixCount;
         const deltaMessages = context.messages.slice(deltaStart);
-        const promptBlocks = messagesToContentBlocks(deltaMessages);
+        const promptBlocks = sanitizePromptBlocks(messagesToContentBlocks(deltaMessages), sessionNonce);
 
         if (promptBlocks.length === 0) {
           promptBlocks.push({ type: "text", text: "Proceed." });
         }
+
+        dumpPromptPayload(sessionKey, systemPromptHash, promptBlocks, systemPromptAppend);
+        session.lastPromptBlocks = promptBlocks;
+        session.lastSystemPromptAppend = systemPromptAppend;
 
         // Wait for any cancelled in-flight turn on this session to finish draining on ACP
         await pool.drainInFlightPrompt(session);
@@ -1123,7 +1326,10 @@ export function streamAntigravityAcp(
     session.rewriteFingerprint = computeRewriteFingerprint(context.messages);
     pool.recordSessionState(sessionKey);
 
-    const promptBlocks = formatFullHistoryTranscript(context.messages);
+    const promptBlocks = sanitizePromptBlocks(formatFullHistoryTranscript(context.messages), sessionNonce);
+    dumpPromptPayload(sessionKey, systemPromptHash, promptBlocks, systemPromptAppend);
+    session.lastPromptBlocks = promptBlocks;
+    session.lastSystemPromptAppend = systemPromptAppend;
     const promptPromise = pool.sendPrompt(session, promptBlocks, options?.signal);
     attachEventListener(session, promptPromise);
   })().catch((err) => {

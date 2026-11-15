@@ -498,6 +498,14 @@ export interface LiveAcpSession {
   } | null;
   eventListener: ((ev: AcpUpdateEvent) => void) | null;
   lastUsedAt: number;
+  /**
+   * Last outbound `session/prompt` payload, stashed so a failure handler can
+   * dump the exact rejected bytes without any pre-armed flag. Text blocks
+   * only; images are never retained here.
+   */
+  lastPromptBlocks?: any[];
+  /** System instruction that accompanied {@link lastPromptBlocks}. */
+  lastSystemPromptAppend?: string;
 }
 
 /**
