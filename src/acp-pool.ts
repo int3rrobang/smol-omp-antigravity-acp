@@ -534,15 +534,22 @@ export class AcpSessionPool {
   private evictionInterval: NodeJS.Timeout | null = null;
   private connecting: Promise<AcpConnection> | null = null;
   private resumeCandidates = new Map<string, PersistedAcpSessionState>();
+  /**
+   * Durable-state writers keyed by omp session. A process can host a main
+   * session and several subagent sessions; each runner supplies the `pi`
+   * bound to its own session, so a snapshot is always persisted into the
+   * session that produced it.
+   */
+  private sessionStateWriters = new Map<
+    string,
+    (state: PersistedAcpSessionState | null) => boolean
+  >();
+  /** Snapshots taken while the owning runner was between active handlers. */
+  private pendingSessionStates = new Map<string, PersistedAcpSessionState>();
   /** omp's tokenizer estimate for the session, captured outside the stream. */
   private ompContextTokens = new Map<string, number>();
   /** In-flight session setup per key, so concurrent turns cannot interleave it. */
   private sessionCreations = new Map<string, Promise<unknown>>();
-  /**
-   * Persist (or clear, with `null`) this session's ACP handle. The host wires
-   * this to `pi.appendEntry` so the handle rides along with the omp session.
-   */
-  public onSessionState?: (sessionKey: string, state: PersistedAcpSessionState | null) => void;
   /** Non-fatal problems worth showing the user (e.g. a model switch agy rejected). */
   public onWarning?: (message: string) => void;
 
@@ -631,20 +638,48 @@ export class AcpSessionPool {
     else this.resumeCandidates.delete(sessionKey);
   }
 
-  public hasResumeCandidate(sessionKey: string, cwd?: string, systemPromptHash?: string): boolean {
+  public hasResumeCandidate(sessionKey: string, cwd?: string): boolean {
     const candidate = this.resumeCandidates.get(sessionKey);
     if (!candidate) return false;
     if (cwd && candidate.cwd !== cwd) return false;
-    if (systemPromptHash && candidate.systemPromptHash !== systemPromptHash) return false;
     return true;
+  }
+
+  /** Wire a session key to the `pi.appendEntry` that owns its session file. */
+  public setSessionStateWriter(
+    sessionKey: string,
+    writer: ((state: PersistedAcpSessionState | null) => boolean) | null,
+  ): void {
+    if (writer) this.sessionStateWriters.set(sessionKey, writer);
+    else this.sessionStateWriters.delete(sessionKey);
+    const pending = this.pendingSessionStates.get(sessionKey);
+    if (writer && pending) {
+      try {
+        if (writer(pending)) this.pendingSessionStates.delete(sessionKey);
+      } catch {}
+    }
+  }
+
+  public removeSessionStateWriter(sessionKey: string): void {
+    this.sessionStateWriters.delete(sessionKey);
+    this.pendingSessionStates.delete(sessionKey);
   }
 
   /** Snapshot the checkpoint so a later process can resume from it. */
   public recordSessionState(sessionKey: string): void {
-    if (!this.onSessionState) return;
     const session = this.sessions.get(sessionKey);
     const state = session ? this.snapshotSession(session) : null;
-    if (state) this.onSessionState(sessionKey, state);
+    if (!state) return;
+    const writer = this.sessionStateWriters.get(sessionKey);
+    if (!writer) {
+      this.pendingSessionStates.set(sessionKey, state);
+      return;
+    }
+    try {
+      if (!writer(state)) this.pendingSessionStates.set(sessionKey, state);
+    } catch {
+      this.pendingSessionStates.set(sessionKey, state);
+    }
   }
 
   /** A conversation is resumable once at least one turn has been checkpointed. */
@@ -666,7 +701,12 @@ export class AcpSessionPool {
 
   /** Drop any durable handle for this session (branch switch, reset). */
   public clearPersistedSession(sessionKey: string): void {
-    this.onSessionState?.(sessionKey, null);
+    this.pendingSessionStates.delete(sessionKey);
+    const writer = this.sessionStateWriters.get(sessionKey);
+    if (!writer) return;
+    try {
+      writer(null);
+    } catch {}
   }
 
   public async createSession(
@@ -778,7 +818,7 @@ export class AcpSessionPool {
     // re-billed tokens. `session/resume` is the validating call — it fails for a
     // conversation agy no longer has, whereas `session/load` silently starts an
     // empty one under the same id and would drop the history without a trace.
-    if (resume && resume.cwd === cwd && resume.systemPromptHash === systemPromptHash) {
+    if (resume && resume.cwd === cwd) {
       try {
         const restored = (await conn.request(
           "session/resume",
@@ -1230,6 +1270,9 @@ export class AcpSessionPool {
       // so the next turn reattaches with session/resume instead of replaying
       // the transcript into a fresh session.
       const candidate = this.snapshotSession(session);
+      // Persist the final checkpoint before dropping the live handle; the
+      // per-session writer targets the session that owns this conversation.
+      this.recordSessionState(key);
       this.resetSession(key).catch(() => {});
       if (candidate) this.setResumeCandidate(key, candidate);
     }
@@ -1244,6 +1287,7 @@ export class AcpSessionPool {
     this.sessions.delete(sessionKey);
     this.acpToLiveSession.delete(session.acpSessionId);
     this.resumeCandidates.delete(sessionKey);
+    this.pendingSessionStates.delete(sessionKey);
   }
 
   public async closeAll(): Promise<void> {
@@ -1260,6 +1304,8 @@ export class AcpSessionPool {
     }
     this.sessions.clear();
     this.acpToLiveSession.clear();
+    this.sessionStateWriters.clear();
+    this.pendingSessionStates.clear();
 
     if (this.conn) {
       await this.conn.close();

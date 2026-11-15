@@ -47,6 +47,20 @@ export * from "./src/types.ts";
  */
 const SESSION_STATE_ENTRY = "smol.omp-antigravity-acp.session";
 
+/**
+ * One ACP pool per process. omp rebinds extension factories to every
+ * subagent session, but provider registrations are process-wide: a
+ * per-factory pool lets the newest subagent's pool capture the parent's next
+ * request, and its single session key drops the parent's checkpoints. A
+ * shared pool keeps every live ACP conversation addressable by its omp
+ * session key.
+ */
+let sharedPool: AcpSessionPool | undefined;
+let sharedProviderRegistered = false;
+function getSharedPool(): AcpSessionPool {
+  return (sharedPool ??= new AcpSessionPool());
+}
+
 interface SessionBranchEntry {
   type?: string;
   customType?: string;
@@ -75,29 +89,49 @@ function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "w
 }
 
 export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void {
-  // Singleton pool for this extension runtime
-  const pool = new AcpSessionPool();
+  // One pool per process; every runner (main and subagents) addresses its own
+  // session key inside it.
+  const pool = getSharedPool();
 
-  // Only the session this extension was registered for gets a durable handle;
-  // subagent sessions run without a session manager here.
-  let mainSessionId: string | undefined;
+  // The session this runner owns. Subagent runners set their own id; the same
+  // runner can move to a new main session on /resume.
+  let runnerSessionId: string | undefined;
 
   pool.onWarning = (message) => {
     pi.logger?.warn?.(message);
   };
 
-  pool.onSessionState = (sessionKey, state) => {
-    if (!mainSessionId || sessionKey !== mainSessionId) return;
-    try {
-      pi.appendEntry?.(SESSION_STATE_ENTRY, { sessionKey, state });
-    } catch {}
+  /**
+   * Register this runner's durable-state writer. The shared pool can hold
+   * sessions from several runners, so pairing a session key with the `pi`
+   * that owns it is what keeps a subagent's checkpoint out of the parent's
+   * file (and vice versa).
+   */
+  const registerSessionStateWriter = (sessionId: string): void => {
+    pool.setSessionStateWriter(sessionId, (state) => {
+      try {
+        pi.appendEntry?.(SESSION_STATE_ENTRY, { sessionKey: sessionId, state });
+        return true;
+      } catch {
+        return false;
+      }
+    });
   };
 
   const restoreResumeCandidate = (ctx: unknown): void => {
     const manager = sessionManagerOf(ctx);
     const sessionId = manager?.getSessionId?.();
     if (!sessionId) return;
-    mainSessionId = sessionId;
+    const agentKind = (ctx as { agent?: { kind?: string } } | undefined)?.agent?.kind;
+    // A subagent's `session_start` is also delivered to the parent runner.
+    // Only the runner that owns the session may adopt it; the parent keeps
+    // its own id and writer.
+    if (runnerSessionId && runnerSessionId !== sessionId && agentKind !== "main") return;
+    if (runnerSessionId && runnerSessionId !== sessionId) {
+      pool.removeSessionStateWriter(runnerSessionId);
+    }
+    runnerSessionId = sessionId;
+    registerSessionStateWriter(sessionId);
 
     let latest: PersistedAcpSessionState | null = null;
     for (const entry of manager?.getBranch?.() ?? []) {
@@ -121,9 +155,9 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // original continuation — reattaching it on the new branch would splice in
   // turns the branch does not have, so drop the handle instead.
   const dropResumeCandidate = (_event: unknown, ctx: unknown): void => {
-    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? runnerSessionId;
     if (!sessionId) return;
-    if (mainSessionId && sessionId !== mainSessionId) return;
+    if (runnerSessionId && sessionId !== runnerSessionId) return;
     pool.markStale(sessionId);
     pool.setResumeCandidate(sessionId, null);
     pool.clearPersistedSession(sessionId);
@@ -133,9 +167,9 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   // pruning, and image drops. Mark the live ACP conversation stale so the next
   // provider request rebuilds it instead of appending to a pre-rewrite prefix.
   const invalidateSession = (ctx: unknown): void => {
-    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? runnerSessionId;
     if (!sessionId) return;
-    if (mainSessionId && sessionId !== mainSessionId) return;
+    if (runnerSessionId && sessionId !== runnerSessionId) return;
     pool.markStale(sessionId);
     pool.setResumeCandidate(sessionId, null);
     pool.clearPersistedSession(sessionId);
@@ -155,9 +189,9 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   };
 
   const captureContextUsage = (ctx: unknown): void => {
-    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? mainSessionId;
+    const sessionId = sessionManagerOf(ctx)?.getSessionId?.() ?? runnerSessionId;
     if (!sessionId) return;
-    if (mainSessionId && sessionId !== mainSessionId) return;
+    if (runnerSessionId && sessionId !== runnerSessionId) return;
     pool.setOmpContextTokens(sessionId, contextUsageTokens(ctx));
   };
 
@@ -180,6 +214,13 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
     captureContextUsage(ctx);
   });
   pi.on?.("agent_end", (_event, ctx) => {
+    const sid = sessionManagerOf(ctx)?.getSessionId?.() ?? runnerSessionId;
+    // The last tool-loop checkpoint may have been written while another
+    // session was active. Flush the finished session now that this runner is
+    // active again; the per-session writer keeps it in the right file.
+    if (sid && (!runnerSessionId || sid === runnerSessionId)) {
+      pool.recordSessionState(sid);
+    }
     captureContextUsage(ctx);
   });
   // Automatic shake/snapcompact/full summaries emit this pair; the end event
@@ -205,33 +246,38 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
     }
   });
 
-  // Register the provider
-  pi.registerProvider(ANTIGRAVITY_PROVIDER_NAME, {
-    baseUrl: "https://daily-cloudcode-pa.googleapis.com",
-    api: ANTIGRAVITY_API_NAME,
-    apiKey: "acp-managed",
-    auth: "none",
-    oauth: {
-      name: "Google Antigravity (Official ACP)",
-      async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string> {
-        return await pool.authenticateInteractive(callbacks);
+  // Register the provider once per process. Subagent factories are rebound
+  // with the same shared pool, so re-registering would only replace the global
+  // entry with an equivalent one.
+  if (!sharedProviderRegistered) {
+    sharedProviderRegistered = true;
+    pi.registerProvider(ANTIGRAVITY_PROVIDER_NAME, {
+      baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+      api: ANTIGRAVITY_API_NAME,
+      apiKey: "acp-managed",
+      auth: "none",
+      oauth: {
+        name: "Google Antigravity (Official ACP)",
+        async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string> {
+          return await pool.authenticateInteractive(callbacks);
+        },
+        refreshToken(creds: OAuthCredentials): Promise<OAuthCredentials> {
+          return Promise.resolve(creds);
+        },
+        getApiKey(creds: OAuthCredentials): string {
+          return creds.access || "acp-managed";
+        },
       },
-      refreshToken(creds: OAuthCredentials): Promise<OAuthCredentials> {
-        return Promise.resolve(creds);
+      streamSimple: (model, context, options) => {
+        return streamAntigravityAcp(pool, model, context, options);
       },
-      getApiKey(creds: OAuthCredentials): string {
-        return creds.access || "acp-managed";
+      usage: antigravityAcpUsageProvider,
+      models: ANTIGRAVITY_MODELS,
+      fetchDynamicModels: async () => {
+        return await pool.discoverModels();
       },
-    },
-    streamSimple: (model, context, options) => {
-      return streamAntigravityAcp(pool, model, context, options);
-    },
-    usage: antigravityAcpUsageProvider,
-    models: ANTIGRAVITY_MODELS,
-    fetchDynamicModels: async () => {
-      return await pool.discoverModels();
-    },
-  });
+    });
+  }
 
   // Slash commands
   if (typeof pi.registerCommand === "function") {
@@ -324,10 +370,21 @@ export default function registerAntigravityAcpExtension(pi: ExtensionAPI): void 
   }
 
   // Graceful shutdown on session end (never throw out of teardown:
-  // an unhandled rejection here takes down the whole host process).
-  pi.on?.("session_shutdown", async () => {
+  // an unhandled rejection here takes down the whole host process). A
+  // subagent shutdown must tear down only its own session; the shared ACP
+  // process still serves the parent. The main session closes the pool.
+  pi.on?.("session_shutdown", async (_event, ctx) => {
     try {
-      await pool.closeAll();
+      const sid = sessionManagerOf(ctx)?.getSessionId?.() ?? runnerSessionId;
+      const isSubagent = (ctx as { agent?: { kind?: string } } | undefined)?.agent?.kind === "sub";
+      if (sid && (!runnerSessionId || sid === runnerSessionId)) {
+        pool.recordSessionState(sid);
+        await pool.resetSession(sid).catch(() => {});
+        pool.removeSessionStateWriter(sid);
+      }
+      if (!isSubagent) {
+        await pool.closeAll();
+      }
     } catch {}
   });
 }

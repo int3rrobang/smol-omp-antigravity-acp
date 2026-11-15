@@ -806,7 +806,7 @@ export function streamAntigravityAcp(
     // the first turn after an omp restart, materialize it before the delta
     // checks; otherwise the adapter always falls through to Case 3 and cold
     // replays the whole transcript.
-    if (!session && pool.hasResumeCandidate(sessionKey, cwd, systemPromptHash)) {
+    if (!session && pool.hasResumeCandidate(sessionKey, cwd)) {
       session = await pool.createSession(
         sessionKey,
         cwd,

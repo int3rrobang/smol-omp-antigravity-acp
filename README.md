@@ -190,6 +190,7 @@ OMP_AGY_USAGE_SOURCE=off
 
 ### 2. Session Keep-Alive & Delta Sync ([`src/stream-adapter.ts`](./src/stream-adapter.ts))
 
+- The pool is process-wide: a subagent runner reuses the main `agy acp` process, while each omp `sessionId` keeps its own live ACP conversation, checkpoint, and durable-state writer.
 - Active sessions are kept alive in memory keyed by OMP's `sessionId`. Follow-up turns append incremental message deltas rather than re-uploading the entire transcript, keeping server-side KV cache warm.
 - Model and thinking effort updates apply in-place via `session/set_config_option` without wiping session history.
 - If a turn is interrupted or cancelled, the adapter drains the server response and checkpoints the accepted boundary so subsequent steering turns continue on the warm session without triggering a cold replay.
