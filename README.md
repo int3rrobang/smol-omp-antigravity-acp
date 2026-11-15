@@ -1,5 +1,19 @@
 # smol-omp-antigravity-acp
 
+> [!IMPORTANT]
+> **This extension is effectively superseded. Use upstream omp's built-in `antigravity-cli` provider instead.**
+>
+> oh-my-pi 18.20.2+ includes an ACP-based Antigravity provider that manages the `agy` binary, drives Google's native sign-in, isolates credentials per account, and is covered by upstream tests. For almost everyone, this repo is no longer useful.
+>
+> ```bash
+> omp login antigravity-cli
+> omp --model antigravity-cli/gemini-4-carbon
+> ```
+>
+> In the TUI, run `/login antigravity-cli` and pick an `antigravity-cli/...` model. See [upstream's Antigravity CLI docs](https://omp.sh/docs/providers#antigravity-cli).
+>
+> Keep this extension only if you specifically need the `google-antigravity` provider ID for existing configs/subagent roles, or the quota-aware `/usage` panel. For new setups, don't install it.
+
 A smol, [`omp`](https://github.com/can1357/oh-my-pi)-native extension that overrides the `google-antigravity` provider by routing requests through Google's official Antigravity CLI over the Agent Client Protocol (ACP) instead of spoofing raw HTTP requests for ToS compliance.
 
 > [!WARNING]
@@ -56,9 +70,11 @@ By running `agy acp` locally as a subprocess, the official binary handles authen
 
 ---
 
-## Installation
+## Installation (legacy)
 
-### Option 1: Direct GitHub Install (Recommended)
+> Prefer upstream `antigravity-cli` above. These instructions are only for existing users who still need the `google-antigravity` provider ID or the optional `/usage` integration.
+
+### Option 1: Direct GitHub Install
 
 Install directly via `oh-my-pi`'s built-in plugin manager:
 
